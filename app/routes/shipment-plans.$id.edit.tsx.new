@@ -1,0 +1,369 @@
+import type { LoaderFunctionArgs, ActionFunctionArgs, MetaFunction } from "react-router";
+import { useLoaderData, useNavigation, redirect, useActionData, Link } from "react-router";
+import { requireAuth } from "~/lib/auth.server";
+import { prisma } from "~/lib/prisma.server";
+import { AdminLayout } from "~/components/AdminLayout";
+import { ShipmentPlanForm } from "~/components/ShipmentPlanForm";
+
+export const meta: MetaFunction = () => {
+  return [
+    { title: "Edit Shipment Plan - Cargo Care" },
+    { name: "description", content: "Edit shipment plan" },
+  ];
+};
+
+export async function loader({ request, params }: LoaderFunctionArgs) {
+  try {
+    const user = await requireAuth(request);
+    
+    // Only allow SHIPMENT_PLAN_TEAM and ADMIN
+    if (user.role.name !== "SHIPMENT_PLAN_TEAM" && user.role.name !== "ADMIN") {
+      return redirect("/dashboard");
+    }
+
+    const planId = params.id;
+    if (!planId) {
+      return redirect("/shipment-plans");
+    }    const shipmentPlan = await prisma.shipmentPlan.findUnique({
+      where: { id: planId },
+      include: {
+        user: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+          },
+        },
+        linerBooking: {
+          include: {
+            user: {
+              select: {
+                id: true,
+                name: true,
+                email: true,
+              },
+            },
+          },
+        },
+      },
+    });
+
+    if (!shipmentPlan) {
+      return redirect("/shipment-plans");
+    }    // Check permissions
+    if (user.role.name !== "ADMIN" && shipmentPlan.userId !== user.id) {
+      return redirect("/shipment-plans");
+    }
+
+    // Fetch data points for dropdowns
+    const [
+      businessBranches,
+      commodities,
+      equipment,
+      loadingPorts,
+      portsOfDischarge,
+      destinationCountries,
+      vessels,
+      carriers,
+      organizations
+    ] = await Promise.all([
+      prisma.businessBranch.findMany({ orderBy: { name: "asc" } }),
+      prisma.commodity.findMany({ orderBy: { name: "asc" } }),
+      prisma.equipment.findMany({ orderBy: { name: "asc" } }),
+      prisma.loadingPort.findMany({ orderBy: { name: "asc" } }),
+      prisma.portOfDischarge.findMany({ orderBy: { name: "asc" } }),
+      prisma.destinationCountry.findMany({ orderBy: { name: "asc" } }),
+      prisma.vessel.findMany({ orderBy: { name: "asc" } }),
+      prisma.carrier.findMany({ orderBy: { name: "asc" } }),
+      prisma.organization.findMany({ orderBy: { name: "asc" } })
+    ]);
+
+    return { 
+      user, 
+      shipmentPlan, 
+      dataPoints: {
+        businessBranches,
+        commodities,
+        equipment,
+        loadingPorts,
+        portsOfDischarge,
+        destinationCountries,
+        vessels,
+        carriers,
+        organizations
+      }
+    };
+  } catch (error) {
+    return redirect("/login");
+  }
+}
+
+export async function action({ request, params }: ActionFunctionArgs) {
+  console.log("Edit shipment plan action called");
+  try {
+    const user = await requireAuth(request);
+    
+    // Only allow SHIPMENT_PLAN_TEAM and ADMIN
+    if (user.role.name !== "SHIPMENT_PLAN_TEAM" && user.role.name !== "ADMIN") {
+      return redirect("/dashboard");
+    }
+
+    const planId = params.id;
+    if (!planId) {
+      return redirect("/shipment-plans");
+    }
+
+    // Check if the plan exists and user has permission
+    const existingPlan = await prisma.shipmentPlan.findUnique({
+      where: { id: planId },
+    });
+
+    if (!existingPlan) {
+      return { error: "Shipment plan not found" };
+    }
+
+    if (user.role.name !== "ADMIN" && existingPlan.userId !== user.id) {
+      return { error: "You don't have permission to edit this shipment plan" };
+    }    const formData = await request.formData();
+    console.log("Updating shipment plan");
+
+    // Check if unmapping approval was requested
+    const approveUnmapping = formData.get("approve_unmapping") === "true";
+    
+    if (approveUnmapping) {
+      // Handle unmapping approval - unlink the records and update statuses
+      const currentPlan = await prisma.shipmentPlan.findUnique({
+        where: { id: planId },
+        include: { linerBooking: true },
+      });
+      
+      if (currentPlan?.linerBooking) {
+        // Update liner booking status and clear link
+        const linerBookingData = currentPlan.linerBooking.data as any;
+        await prisma.linerBooking.update({
+          where: { id: currentPlan.linerBooking.id },
+          data: { 
+            data: {
+              ...linerBookingData,
+              booking_status: "Approved"
+            }
+          }
+        });
+
+        // Update shipment plan status and clear link
+        const shipmentPlanData = existingPlan.data as any;
+        await prisma.shipmentPlan.update({
+          where: { id: planId },
+          data: { 
+            data: {
+              ...shipmentPlanData,
+              booking_status: "Booked"
+            },
+            linerBookingId: null
+          }
+        });
+
+        return redirect("/shipment-plans");
+      }
+    }    // Get form values
+    const bussiness_branch = formData.get("bussiness_branch") as string;
+    const shipment_type = formData.get("shipment_type") as string;
+    const booking_status = formData.get("booking_status") as string;
+    const loading_port = formData.get("loading_port") as string;
+    const destination_country = formData.get("destination_country") as string;
+    const customer = formData.get("customer") as string;
+
+    // Parse package details from form data
+    const packageDetails: any[] = [];
+    let packageIndex = 0;
+    while (formData.get(`package_details[${packageIndex}][shipper]`) !== null) {
+      packageDetails.push({
+        shipper: formData.get(`package_details[${packageIndex}][shipper]`) as string,
+        invoice_number: formData.get(`package_details[${packageIndex}][invoice_number]`) as string,
+        volume: parseFloat(formData.get(`package_details[${packageIndex}][volume]`) as string) || 0,
+        gross_weight: parseFloat(formData.get(`package_details[${packageIndex}][gross_weight]`) as string) || 0,
+        number_of_packages: parseInt(formData.get(`package_details[${packageIndex}][number_of_packages]`) as string) || 0,
+        projected_cargo_ready_date: formData.get(`package_details[${packageIndex}][projected_cargo_ready_date]`) as string,
+        commodity: formData.get(`package_details[${packageIndex}][commodity]`) as string,
+        is_haz: formData.get(`package_details[${packageIndex}][is_haz]`) === "true",
+        p_o_number: formData.get(`package_details[${packageIndex}][p_o_number]`) as string,
+        C_H_A: formData.get(`package_details[${packageIndex}][C_H_A]`) === "true"
+      });
+      packageIndex++;
+    }    // Parse equipment details from form data
+    const equipmentDetails: any[] = [];
+    let equipmentIndex = 0;
+    while (formData.get(`equipment_details[${equipmentIndex}][equipment_type]`) !== null) {
+      equipmentDetails.push({
+        equipment_type: formData.get(`equipment_details[${equipmentIndex}][equipment_type]`) as string,
+        number_of_equipment: parseInt(formData.get(`equipment_details[${equipmentIndex}][number_of_equipment]`) as string) || 0,
+        stuffing_point: formData.get(`equipment_details[${equipmentIndex}][stuffing_point]`) as string,
+        empty_container_pick_up_from: formData.get(`equipment_details[${equipmentIndex}][empty_container_pick_up_from]`) as string,
+        container_handover_location: formData.get(`equipment_details[${equipmentIndex}][container_handover_location]`) as string,
+        empty_container_pick_up_location: formData.get(`equipment_details[${equipmentIndex}][empty_container_pick_up_location]`) as string,
+        container_handover_at: formData.get(`equipment_details[${equipmentIndex}][container_handover_at]`) as string,
+      });      equipmentIndex++;
+    }
+
+    // Get container tracking fields
+    const container_stuffing_completed_date = formData.get("container_stuffing_completed_date") as string;
+    const empty_container_picked_up_date = formData.get("empty_container_picked_up_date") as string;
+    const gated_in_date = formData.get("gated_in_date") as string;
+    const loaded_on_board_date = formData.get("loaded_on_board_date") as string;
+
+    const shipmentData = {
+      reference_number: (existingPlan.data as any).reference_number, // Keep existing reference number
+      bussiness_branch,
+      shipment_type,
+      booking_status,
+      package_details: packageDetails,
+      equipment_details: equipmentDetails,
+      container_movement: {
+        loading_port,
+        destination_country,
+        delivery_till: formData.get("delivery_till") as string,
+        port_of_discharge: formData.get("port_of_discharge") as string,
+        final_place_of_delivery: formData.get("final_place_of_delivery") as string,
+        required_free_time_at_destination: formData.get("required_free_time_at_destination") as string,
+        carrier_and_vessel_preference: {
+          carrier: formData.get("carrier") as string,
+          vessel: formData.get("vessel") as string,
+          preferred_etd: formData.get("preferred_etd") as string,
+        },
+        customer,
+        consignee: formData.get("consignee") as string,
+        selling_price: formData.get("selling_price") as string,
+        rebate: formData.get("rebate") as string,
+        credit_period: parseInt(formData.get("credit_period") as string) || 0,
+        buying_price: parseFloat(formData.get("buying_price") as string) || 0,
+        specific_stuffing_requirement: formData.get("specific_stuffing_requirement") === "true",
+        stuffing_instructions: formData.get("stuffing_instructions") as string,
+        specific_instructions: formData.get("specific_instructions") as string,
+        liner_booking_details: formData.get("liner_booking_details") as string,
+      },      container_tracking: {
+        container_current_status: formData.get("container_current_status") as string || "Pending",
+        container_stuffing_completed: formData.get("container_stuffing_completed") === "true",
+        container_stuffing_completed_date: container_stuffing_completed_date ? new Date(container_stuffing_completed_date).toISOString() : null,
+        empty_container_picked_up_status: formData.get("empty_container_picked_up_status") === "true",
+        empty_container_picked_up_date: empty_container_picked_up_date ? new Date(empty_container_picked_up_date).toISOString() : null,
+        gated_in_status: formData.get("gated_in_status") === "true",
+        gated_in_date: gated_in_date ? new Date(gated_in_date).toISOString() : null,
+        loaded_on_board_status: formData.get("loaded_on_board_status") === "true",
+        loaded_on_board_date: loaded_on_board_date ? new Date(loaded_on_board_date).toISOString() : null,
+      }
+    };
+
+    try {
+      console.log("Attempting to update shipment plan in database");
+      await prisma.shipmentPlan.update({
+        where: { id: planId },
+        data: {
+          data: shipmentData,
+        },
+      });
+      console.log("Shipment plan updated successfully");
+
+      return { success: "Shipment plan updated successfully" };
+    } catch (error) {
+      console.error("Failed to update shipment plan:", error);
+      return { 
+        error: "Failed to update shipment plan. Please try again.",
+        formData: Object.fromEntries(formData)
+      };
+    }
+  } catch (error) {
+    console.error("Edit shipment plan action error:", error);
+    return { error: "An error occurred while processing your request" };
+  }
+}
+
+export default function EditShipmentPlan() {
+  const { user, shipmentPlan, dataPoints } = useLoaderData<typeof loader>();
+  const actionData = useActionData<typeof action>();
+  const navigation = useNavigation();
+
+  const planData = shipmentPlan.data as any;
+  const isSubmitting = navigation.state === "submitting";
+
+  return (
+    <AdminLayout user={user}>
+      {/* Page Header */}
+      <div className="bg-white border-b border-gray-200">
+        <div className="px-6 py-6">
+          <div className="flex justify-between items-center">
+            <div className="flex items-center space-x-3">
+              <div className="w-8 h-8 bg-blue-100 rounded-lg flex items-center justify-center">
+                <span className="text-blue-600 text-sm">✏️</span>
+              </div>
+              <div>
+                <h1 className="text-2xl font-semibold text-gray-900">Edit Shipment Plan</h1>
+                <p className="text-sm text-gray-600 mt-1">
+                  Modify shipment plan details - {planData.reference_number}
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center space-x-3">
+              <Link 
+                to={`/shipment-plans/${shipmentPlan.id}`} 
+                className="inline-flex items-center px-4 py-2 text-sm font-medium text-gray-600 hover:text-gray-500 hover:bg-gray-50 rounded-lg transition-all duration-200"
+              >
+                👁️ View Details
+              </Link>
+              <Link 
+                to="/shipment-plans" 
+                className="inline-flex items-center px-4 py-2 text-sm font-medium text-blue-600 hover:text-blue-500 hover:bg-blue-50 rounded-lg transition-all duration-200"
+              >
+                <span className="mr-1">←</span>
+                Back to List
+              </Link>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Main Content */}
+      <div className="flex-1 overflow-auto p-6 bg-gray-50">
+        {actionData?.error && (
+          <div className="mb-8 bg-red-50 border-l-4 border-red-400 p-4 rounded-lg">
+            <div className="flex">
+              <div className="flex-shrink-0">
+                <span className="text-red-400 text-xl">⚠️</span>
+              </div>
+              <div className="ml-3">
+                <p className="text-sm text-red-700 font-medium">Error updating shipment plan</p>
+                <p className="text-sm text-red-600 mt-1">{actionData.error}</p>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Success Message */}
+        {actionData?.success && (
+          <div className="mb-8 bg-green-50 border-l-4 border-green-400 p-4 rounded-lg">
+            <div className="flex">
+              <div className="flex-shrink-0">
+                <span className="text-green-400 text-xl">✅</span>
+              </div>
+              <div className="ml-3">
+                <p className="text-sm text-green-700 font-medium">Shipment plan updated successfully</p>
+                <p className="text-sm text-green-600 mt-1">{actionData.success}</p>
+              </div>
+            </div>
+          </div>
+        )}
+
+        <div className="max-w-5xl mx-auto">
+          <ShipmentPlanForm
+            mode="edit"
+            dataPoints={dataPoints}
+            actionData={actionData}
+            isSubmitting={isSubmitting}
+            planData={planData}
+            shipmentPlan={shipmentPlan}
+            user={user}
+          />
+        </div>
+      </div>
+    </AdminLayout>
+  );
+}
