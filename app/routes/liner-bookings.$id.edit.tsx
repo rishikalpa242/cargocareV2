@@ -48,24 +48,105 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
         throw new Response("Shipment assignment not found", { status: 404 })
       }
 
-      const [availableShipmentPlans, carriers, vessels, organizations] = await Promise.all([
-        prisma.shipmentPlan.findMany({
-          where: { linkedStatus: 0 },
-          select: { id: true, data: true, createdAt: true },
-          orderBy: { createdAt: "desc" },
-        }),
-        prisma.carrier.findMany({ orderBy: { name: "asc" } }),
-        prisma.vessel.findMany({ orderBy: { name: "asc" } }),
-        prisma.organization.findMany({ orderBy: { name: "asc" } }),
-      ])
+      const normalizedData = { ...(assignment.data as any) }
+      if (assignment.shipmentPlan && assignment.shipmentPlan.linkedStatus === 0) {
+        if (Array.isArray(normalizedData.equipment_details) && normalizedData.equipment_details.length > 0) {
+          console.log("[v0] loader: clearing stale equipment_details for unlinked assignment", {
+            assignmentId,
+            equipmentCount: normalizedData.equipment_details.length,
+          })
+        }
+        normalizedData.equipment_details = []
+        // liner_booking_details should also be empty post-unlink; keep only if explicitly needed by UI
+        if (Array.isArray(normalizedData.liner_booking_details) && normalizedData.liner_booking_details.length > 0) {
+          console.log("[v0] loader: clearing stale liner_booking_details for unlinked assignment", {
+            assignmentId,
+            detailCount: normalizedData.liner_booking_details.length,
+          })
+        }
+        normalizedData.liner_booking_details = []
+      }
+
+      const [availableShipmentPlans, carriers, vessels, organizations, equipment, availableLinerBookings] =
+        await Promise.all([
+          prisma.shipmentPlan.findMany({
+            where: { linkedStatus: 0 },
+            select: { id: true, data: true, createdAt: true },
+            orderBy: { createdAt: "desc" },
+          }),
+          prisma.carrier.findMany({ orderBy: { name: "asc" } }),
+          prisma.vessel.findMany({ orderBy: { name: "asc" } }),
+          prisma.organization.findMany({ orderBy: { name: "asc" } }),
+          prisma.equipment.findMany({ orderBy: { name: "asc" } }), // include equipment for edit UI fallback
+          prisma.linerBooking.findMany({
+            where: {
+              shipmentPlanId: null,
+            },
+            select: {
+              id: true,
+              createdAt: true,
+              data: true,
+              user: { select: { id: true, name: true } },
+            },
+            orderBy: { createdAt: "desc" },
+          }),
+        ])
+
+      let filteredAvailableLinerBookings = availableLinerBookings
+      try {
+        const planData = (assignment?.shipmentPlan?.data as any) ?? {}
+        const requiredEquipmentArr = Array.isArray(planData?.equipment_details) ? planData.equipment_details : []
+        const requiredTypes = new Set(
+          requiredEquipmentArr
+            .map((e: any) => e?.equipment_type)
+            .filter((t: any) => typeof t === "string" && t.trim() !== ""),
+        )
+
+        const allowedStatuses = new Set([
+          "available",
+          "ready for re-linking",
+          "ready for re‑linking", // include variant with non-breaking hyphen, if present
+        ])
+
+        filteredAvailableLinerBookings = availableLinerBookings.filter((b: any) => {
+          const statusRaw = (b?.data?.carrier_booking_status ?? "").toString()
+          const status = statusRaw.toLowerCase()
+          const statusOk = status === "" || allowedStatuses.has(status)
+
+          if (!statusOk) return false
+
+          if (requiredTypes.size === 0) return true
+
+          const ed: any[] = Array.isArray(b?.data?.equipment_details) ? b.data.equipment_details : []
+          const lbd: any[] = Array.isArray(b?.data?.liner_booking_details) ? b.data.liner_booking_details : []
+
+          const typesFromED = ed
+            .map((e) => (typeof e?.equipment_type === "string" ? e.equipment_type.trim() : ""))
+            .filter((t) => t.length > 0)
+
+          const typesFromLBD = lbd
+            .map((d) => (typeof d?.equipment_type === "string" ? d.equipment_type.split("|")[0].trim() : ""))
+            .filter((t) => t.length > 0)
+
+          const bookingTypes = new Set<string>([...typesFromED, ...typesFromLBD])
+
+          // Intersect bookingTypes with requiredTypes
+          for (const t of bookingTypes) {
+            if (requiredTypes.has(t)) return true
+          }
+          return false
+        })
+      } catch (e) {
+        console.error("[v0] loader: filtering availableLinerBookings by status/type failed", e)
+      }
 
       // Provide linerBooking-like shape for the form
       const linerBooking = {
         ...assignment,
+        data: normalizedData,
         shipmentPlan: assignment.shipmentPlan
           ? {
               ...assignment.shipmentPlan,
-              // alias for any conditional checks in form code
               linerBookingId: (assignment.shipmentPlan as any).linerBookingId ?? null,
             }
           : null,
@@ -75,7 +156,9 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
         user,
         linerBooking,
         availableShipmentPlans,
-        dataPoints: { carriers, vessels, organizations },
+        availableLinerBookings: filteredAvailableLinerBookings, // use filtered list
+        isAssignment: true,
+        dataPoints: { carriers, vessels, organizations, equipment },
       }
     }
 
@@ -102,7 +185,7 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
     }
 
     // Fetch available shipment plans for linking (only those without existing liner bookings)
-    const [availableShipmentPlans, carriers, vessels, organizations] = await Promise.all([
+    const [availableShipmentPlans, carriers, vessels, organizations, equipment] = await Promise.all([
       prisma.shipmentPlan.findMany({
         where: {
           linkedStatus: 0, // Only unlinked plans
@@ -117,16 +200,20 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
       prisma.carrier.findMany({ orderBy: { name: "asc" } }),
       prisma.vessel.findMany({ orderBy: { name: "asc" } }),
       prisma.organization.findMany({ orderBy: { name: "asc" } }),
+      prisma.equipment.findMany({ orderBy: { name: "asc" } }), // include equipment for edit UI fallback
     ])
 
     return {
       user,
       linerBooking,
       availableShipmentPlans,
+      availableLinerBookings: [],
+      isAssignment: false,
       dataPoints: {
         carriers,
         vessels,
         organizations,
+        equipment,
       },
     }
   } catch (error) {
@@ -186,6 +273,7 @@ export async function action({ request, params }: ActionFunctionArgs) {
     const url = new URL(request.url)
     const assignmentId = url.searchParams.get("assignmentId")
     const formData = await request.formData()
+    const specialAction = (formData.get("_action") as string) || ""
 
     // Parse common fields and details (shared by both flows)
     const carrier_booking_status = formData.get("current_status") as string
@@ -247,21 +335,106 @@ export async function action({ request, params }: ActionFunctionArgs) {
         ),
         equipment_type: (formData.get(`liner_booking_details[${detailIndex}][equipment_type]`) as string) || "",
         equipment_quantity: (formData.get(`liner_booking_details[${detailIndex}][equipment_quantity]`) as string) || "",
+        booking_for: (formData.get(`liner_booking_details[${detailIndex}][booking_for]`) as string) || "",
       })
       detailIndex++
     }
 
+    if (assignmentId && specialAction === "link_available") {
+      const selectedIds = formData.getAll("selectedAvailableIds") as string[]
+      if (selectedIds.length === 0) {
+        return redirect(`/liner-bookings/${params.id}/edit?assignmentId=${assignmentId}`)
+      }
+
+      const current = await prisma.shipmentAssignment.findUnique({
+        where: { id: assignmentId },
+        include: { shipmentPlan: true },
+      })
+      if (!current || !current.shipmentPlan) {
+        return Response.json({ error: "Shipment assignment or linked shipment plan not found" }, { status: 404 })
+      }
+
+      // Load the selected liner bookings
+      const bookings = await prisma.linerBooking.findMany({
+        where: { id: { in: selectedIds } },
+      })
+
+      // Merge their details into the assignment's data
+      const existingData = ((current.data || {}) as any) ?? {}
+      const existingDetails = Array.isArray(existingData.liner_booking_details)
+        ? existingData.liner_booking_details
+        : []
+      const selectedDetails = bookings.flatMap((b) => {
+        const d = ((b.data as any)?.liner_booking_details || []) as any[]
+        return Array.isArray(d) ? d : []
+      })
+
+      // Deduplicate by temporary_booking_number or liner_booking_number
+      const seen = new Set<string>()
+      const mergedDetails = [...existingDetails]
+      for (const d of selectedDetails) {
+        const key = (d?.temporary_booking_number || d?.liner_booking_number || JSON.stringify(d)) as string
+        if (key && !seen.has(key)) {
+          seen.add(key)
+          mergedDetails.push(d)
+        }
+      }
+
+      // Transaction: link bookings to shipment plan, mark as Booked, update assignment and mark plan as linked
+      await prisma.$transaction(async (tx) => {
+        for (const b of bookings) {
+          const data = (b.data as any) || {}
+          data.carrier_booking_status = "Booked"
+          await tx.linerBooking.update({
+            where: { id: b.id },
+            data: {
+              shipmentPlanId: current.shipmentPlan!.id,
+              data,
+            },
+          })
+        }
+
+        // Update assignment with merged details (do not force Booked status here)
+        await tx.shipmentAssignment.update({
+          where: { id: assignmentId },
+          data: {
+            data: {
+              ...(existingData || {}),
+              liner_booking_details: mergedDetails,
+            } as any,
+          },
+        })
+
+        // Ensure plan is marked as linked so loader doesn't clear details
+        await tx.shipmentPlan.update({
+          where: { id: current.shipmentPlan.id },
+          data: {
+            linkedStatus: 1,
+          },
+        })
+      })
+
+      return redirect(`/liner-bookings/${params.id}/edit?assignmentId=${assignmentId}`)
+    }
+
     // Assignment mode: update shipment_assignments and exit
     if (assignmentId) {
-      console.log("[v0] action: assignment mode", { id, assignmentId })
+      console.log("[v0] action: assignment mode")
+      const allBookingAssigned = formData.get("all_booking_assigned") === "true"
+      const unmappingButtonClicked = formData.get("request_unmapping") === "true"
 
-      const current = await prisma.shipmentAssignment.findUnique({ where: { id: assignmentId } })
+      const current = await prisma.shipmentAssignment.findUnique({
+        where: { id: assignmentId },
+        include: { shipmentPlan: true },
+      })
       if (!current) {
         return Response.json({ error: "Shipment assignment not found" }, { status: 404 })
       }
 
       const existingData = (current.data || {}) as any
-      const updatedData = {
+      const currentStatus = existingData?.carrier_booking_status || "Awaiting MD Approval"
+
+      const updatedData: any = {
         ...existingData,
         ...(carrier_booking_status ? { carrier_booking_status } : {}),
         ...(typeof unmapping_request === "boolean" ? { unmapping_request } : {}),
@@ -270,10 +443,117 @@ export async function action({ request, params }: ActionFunctionArgs) {
         ...(linerBookingDetails.length > 0 ? { liner_booking_details: linerBookingDetails } : {}),
       }
 
+      if (allBookingAssigned) {
+        console.log("[v0] assignment: All Booking Assigned flow")
+        updatedData.carrier_booking_status = "Booked"
+
+        await prisma.shipmentAssignment.update({
+          where: { id: assignmentId },
+          data: { data: updatedData },
+        })
+
+        if (current.shipmentPlan) {
+          const spData = ((current.shipmentPlan.data as any) || {}) as any
+          const prevStatus = spData.booking_status
+          spData.booking_status = "Booked"
+          await prisma.shipmentPlan.update({
+            where: { id: current.shipmentPlan.id },
+            data: { data: spData, linkedStatus: 1 },
+          })
+          console.log("[v0] assignment: updated shipmentPlan booked", {
+            shipmentPlanId: current.shipmentPlan.id,
+            prevStatus,
+            newStatus: spData.booking_status,
+          })
+        }
+
+        try {
+          const detailsToMatch =
+            (linerBookingDetails?.length ?? 0) > 0 ? linerBookingDetails : (updatedData?.liner_booking_details ?? [])
+
+          if (Array.isArray(detailsToMatch) && detailsToMatch.length > 0) {
+            // Load only unlinked (available) liner bookings and filter in code by status + matching equipment details
+            const orphanedBookings = await prisma.linerBooking.findMany({
+              where: {
+                shipmentPlanId: null, // temporary "available" entries are unlinked
+                id: { not: id }, // safety: exclude current route id param if it exists
+              },
+            })
+
+            const bookingsToDelete = orphanedBookings.filter((orphanedBooking) => {
+              const orphanedData = orphanedBooking.data as any
+              return (
+                orphanedData?.carrier_booking_status === "Ready for Re-linking" &&
+                Array.isArray(orphanedData?.liner_booking_details) &&
+                orphanedData.liner_booking_details.some((orphanedDetail: any) =>
+                  detailsToMatch.some(
+                    (currentDetail: any) =>
+                      orphanedDetail?.temporary_booking_number === currentDetail?.temporary_booking_number ||
+                      orphanedDetail?.liner_booking_number === currentDetail?.liner_booking_number,
+                  ),
+                )
+              )
+            })
+
+            if (bookingsToDelete.length > 0) {
+              console.log(
+                `[v0] assignment: deleting ${bookingsToDelete.length} orphan 'Ready for Re-linking' placeholder(s) after re-allocation`,
+              )
+              await prisma.linerBooking.deleteMany({
+                where: { id: { in: bookingsToDelete.map((b) => b.id) } },
+              })
+            } else {
+              console.log("[v0] assignment: no orphan placeholders found to delete after re-allocation")
+            }
+          } else {
+            console.log("[v0] assignment: no liner_booking_details in payload to match placeholders")
+          }
+        } catch (cleanupErr) {
+          console.error("[v0] assignment: cleanup placeholders failed", cleanupErr)
+        }
+
+        return redirect("/liner-bookings?tab=assignments")
+      }
+
+      // Request Unmapping flow (mirror liner-booking behavior)
+      if ((unmapping_request || unmappingButtonClicked) && currentStatus === "Booked") {
+        if (!unmapping_reason || unmapping_reason.trim() === "") {
+          return Response.json({ error: "Unmapping reason is required" }, { status: 400 })
+        }
+
+        console.log("[v0] assignment: Request Unmapping from Booked")
+        updatedData.carrier_booking_status = "Unmapping Requested"
+
+        await prisma.shipmentAssignment.update({
+          where: { id: assignmentId },
+          data: { data: updatedData },
+        })
+
+        if (current.shipmentPlan) {
+          const spData = ((current.shipmentPlan.data as any) || {}) as any
+          const prevStatus = spData.booking_status
+          spData.booking_status = "Unmapping Requested"
+          await prisma.shipmentPlan.update({
+            where: { id: current.shipmentPlan.id },
+            data: { data: spData },
+          })
+          console.log("[v0] assignment: updated shipmentPlan unmapping", {
+            shipmentPlanId: current.shipmentPlan.id,
+            prevStatus,
+            newStatus: spData.booking_status,
+          })
+        }
+
+        return redirect("/liner-bookings?tab=assignments")
+      }
+
+      // No special flow: keep current status
+      updatedData.carrier_booking_status = currentStatus
       await prisma.shipmentAssignment.update({
         where: { id: assignmentId },
         data: { data: updatedData },
       })
+      console.log("[v0] assignment: regular update", { status: updatedData.carrier_booking_status })
 
       return redirect("/liner-bookings?tab=assignments")
     }
@@ -458,7 +738,8 @@ export async function action({ request, params }: ActionFunctionArgs) {
 }
 
 export default function EditLinerBookingPage() {
-  const { user, linerBooking, availableShipmentPlans, dataPoints } = useLoaderData<typeof loader>()
+  const { user, linerBooking, availableShipmentPlans, dataPoints, availableLinerBookings, isAssignment } =
+    useLoaderData<typeof loader>()
   const actionData = useActionData<typeof action>()
 
   return (
@@ -470,6 +751,8 @@ export default function EditLinerBookingPage() {
         dataPoints={dataPoints}
         actionData={actionData}
         user={user}
+        availableLinerBookings={availableLinerBookings}
+        isAssignment={isAssignment}
       />
     </AdminLayout>
   )

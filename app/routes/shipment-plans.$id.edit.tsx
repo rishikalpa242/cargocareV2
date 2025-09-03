@@ -4,6 +4,7 @@ import { requireAuth } from "~/lib/auth.server"
 import { prisma } from "~/lib/prisma.server"
 import { AdminLayout } from "~/components/AdminLayout"
 import { ShipmentPlanForm } from "~/components/ShipmentPlanForm"
+import { Button } from "~/components/ui/button"
 
 export const meta: MetaFunction = () => {
   return [{ title: "Edit Shipment Plan - Cargo Care" }, { name: "description", content: "Edit shipment plan" }]
@@ -33,6 +34,17 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
           },
         },
         linerBooking: {
+          include: {
+            user: {
+              select: {
+                id: true,
+                name: true,
+                email: true,
+              },
+            },
+          },
+        },
+        shipmentAssignment: {
           include: {
             user: {
               select: {
@@ -218,114 +230,181 @@ export async function action({ request, params }: ActionFunctionArgs) {
     const rejectUnmapping = formData.get("reject_unmapping") === "true"
 
     if (approveUnmapping) {
-      // Handle unmapping approval - unlink the records and update statuses
       const currentPlan = await prisma.shipmentPlan.findUnique({
         where: { id: planId },
-        include: { linerBooking: true },
+        include: { linerBooking: true, shipmentAssignment: true },
       })
 
-      if (currentPlan?.linerBooking) {
-        const originalLinerBooking = currentPlan.linerBooking
-        const originalLinerBookingData = originalLinerBooking.data as any
-        const shipmentPlanData = currentPlan.data as any
+      if (!currentPlan) {
+        return redirect("/shipment-plans")
+      }
 
-        if (shipmentPlanData.equipment_details && Array.isArray(shipmentPlanData.equipment_details)) {
-          for (let i = 0; i < shipmentPlanData.equipment_details.length; i++) {
-            const equipment = shipmentPlanData.equipment_details[i]
+      const planData = currentPlan.data as any
+      const linkedType = currentPlan.linerBooking
+        ? "linerBooking"
+        : currentPlan.shipmentAssignment
+          ? "shipmentAssignment"
+          : null
 
-            // Find the corresponding liner booking detail for this equipment
-            let correspondingLinerBookingDetail = null
-            if (
-              originalLinerBookingData.liner_booking_details &&
-              Array.isArray(originalLinerBookingData.liner_booking_details)
-            ) {
-              // Try to match by tracking number or use index as fallback
-              correspondingLinerBookingDetail =
-                originalLinerBookingData.liner_booking_details.find(
-                  (detail: any) => detail.trackingNumber === equipment.trackingNumber,
-                ) ||
-                originalLinerBookingData.liner_booking_details[i] ||
-                originalLinerBookingData.liner_booking_details[0]
-            }
+      console.log("[v0] approve_unmapping", {
+        planId,
+        linkedType,
+        hasEquipments: Array.isArray(planData?.equipment_details) ? planData.equipment_details.length : 0,
+      })
 
-            await prisma.linerBooking.create({
-              data: {
-                data: {
-                  ...originalLinerBookingData,
-                  carrier_booking_status: "Ready for Re-linking",
-                  // Override equipment details to contain only this single equipment
-                  equipment_details: [equipment], // Single equipment per booking
-                  // Override liner booking details to contain only the corresponding detail
-                  liner_booking_details: correspondingLinerBookingDetail ? [correspondingLinerBookingDetail] : [],
-                  // Ensure unmapping flags are reset for the new booking
-                  unmapping_request: false,
-                  unmapping_reason: "",
-                },
-                userId: originalLinerBooking.userId,
-                assignBookingId: originalLinerBooking.assignBookingId,
-                // The new cloned booking is not linked to any shipment plan yet
-                shipmentPlanId: null, // Not linked to any shipment plan initially
-              },
-            })
+      if (!linkedType) {
+        return redirect("/shipment-plans")
+      }
+
+      const original = linkedType === "linerBooking" ? currentPlan.linerBooking! : currentPlan.shipmentAssignment!
+      const originalData = (original.data as any) || {}
+
+      if (planData.equipment_details && Array.isArray(planData.equipment_details)) {
+        for (let i = 0; i < planData.equipment_details.length; i++) {
+          const equipment = planData.equipment_details[i]
+
+          // Find the corresponding liner booking detail for this equipment
+          let correspondingLinerBookingDetail = null
+          if (originalData.liner_booking_details && Array.isArray(originalData.liner_booking_details)) {
+            correspondingLinerBookingDetail =
+              originalData.liner_booking_details.find(
+                (detail: any) => detail.trackingNumber === equipment.trackingNumber,
+              ) ||
+              originalData.liner_booking_details[i] ||
+              originalData.liner_booking_details[0]
           }
-        }
 
-        // Update original liner booking status
+          // Create an individual AVAILABLE liner booking per equipment
+          await prisma.linerBooking.create({
+            data: {
+              data: {
+                ...originalData,
+                carrier_booking_status: "Ready for Re-linking",
+                equipment_details: [equipment],
+                liner_booking_details: correspondingLinerBookingDetail ? [correspondingLinerBookingDetail] : [],
+                unmapping_request: false,
+                unmapping_reason: "",
+              },
+              userId: original.userId,
+              assignBookingId: original.assignBookingId || null,
+              shipmentPlanId: null, // available, not linked to any plan
+            },
+          })
+        }
+      }
+
+      // Update the original linked record to Awaiting Booking and clear unmapping flags
+      if (linkedType === "linerBooking") {
         await prisma.linerBooking.update({
-          where: { id: originalLinerBooking.id },
+          where: { id: currentPlan.linerBooking!.id },
           data: {
             data: {
-              ...originalLinerBookingData,
+              ...originalData,
               carrier_booking_status: "Awaiting Booking",
               unmapping_request: false,
               unmapping_reason: "",
             },
-            shipmentPlanId: currentPlan?.id || null,
+            // keep relation as-is (mirrors previous behavior); plan will be unlinked via linkedStatus below
+            shipmentPlanId: currentPlan.id,
           },
         })
+      } else {
+        const clearedAssignmentData = {
+          ...originalData,
+          carrier_booking_status: "Awaiting Booking",
+          unmapping_request: false,
+          unmapping_reason: "",
+          equipment_details: [], // clear linked equipments
+          liner_booking_details: [], // clear booking detail groupings, they'll exist on split records
+        }
 
-        // Update shipment plan status and clear link
-        await prisma.shipmentPlan.update({
-          where: { id: planId },
+        await prisma.shipmentAssignment.update({
+          where: { id: currentPlan.shipmentAssignment!.id },
           data: {
-            data: {
-              ...shipmentPlanData,
-              booking_status: "Awaiting Booking",
-            },
-            linkedStatus: 0,
+            data: clearedAssignmentData,
+            // keep relation as-is; plan will be marked unlinked for UI
+            shipmentPlanId: currentPlan.id,
           },
         })
 
-        return redirect("/shipment-plans")
+        console.log("[v0] approve_unmapping: cleared assignment equipment_details/liner_booking_details", {
+          assignmentId: currentPlan.shipmentAssignment!.id,
+          planId,
+        })
       }
+
+      // Update shipment plan status and unlink marker
+      await prisma.shipmentPlan.update({
+        where: { id: planId },
+        data: {
+          data: {
+            ...planData,
+            booking_status: "Awaiting Booking",
+          },
+          linkedStatus: 0,
+        },
+      })
+
+      return redirect("/shipment-plans")
     }
 
     if (rejectUnmapping) {
-      // Handle unmapping rejection - keep records linked but clear unmapping request
       const currentPlan = await prisma.shipmentPlan.findUnique({
         where: { id: planId },
-        include: { linerBooking: true },
+        include: { linerBooking: true, shipmentAssignment: true },
       })
 
-      if (currentPlan?.linerBooking) {
-        // Update liner booking to clear unmapping request and revert to Booked status
-        const linerBookingData = currentPlan.linerBooking.data as any
+      if (!currentPlan) {
+        return redirect("/shipment-plans")
+      }
+
+      const linkedType = currentPlan.linerBooking
+        ? "linerBooking"
+        : currentPlan.shipmentAssignment
+          ? "shipmentAssignment"
+          : null
+
+      console.log("[v0] reject_unmapping", { planId, linkedType })
+
+      if (!linkedType) {
+        return redirect("/shipment-plans")
+      }
+
+      const originalData =
+        linkedType === "linerBooking"
+          ? (currentPlan.linerBooking!.data as any) || {}
+          : (currentPlan.shipmentAssignment!.data as any) || {}
+
+      if (linkedType === "linerBooking") {
         await prisma.linerBooking.update({
-          where: { id: currentPlan.linerBooking.id },
+          where: { id: currentPlan.linerBooking!.id },
           data: {
             data: {
-              ...linerBookingData,
+              ...originalData,
               carrier_booking_status: "Booked",
               unmapping_request: false,
               unmapping_reason: "",
             },
-            linkedStatus: 1,
           },
         })
-
-        return redirect("/shipment-plans")
+      } else {
+        await prisma.shipmentAssignment.update({
+          where: { id: currentPlan.shipmentAssignment!.id },
+          data: {
+            data: {
+              ...originalData,
+              carrier_booking_status: "Booked",
+              unmapping_request: false,
+              unmapping_reason: "",
+            },
+          },
+        })
       }
-    } // Get form values
+
+      return redirect("/shipment-plans")
+    }
+
+    // Get form values
     const bussiness_branch = formData.get("bussiness_branch") as string
     const shipment_type = formData.get("shipment_type") as string
     const booking_status = formData.get("booking_status") as string
@@ -551,6 +630,10 @@ export default function EditShipmentPlan() {
   const planData = shipmentPlan.data as any
   const isSubmitting = navigation.state === "submitting"
 
+  const unmappingRequested =
+    Boolean((shipmentPlan.linerBooking?.data as any)?.unmapping_request) ||
+    Boolean((shipmentPlan.shipmentAssignment?.data as any)?.unmapping_request)
+
   return (
     <AdminLayout user={user}>
       {/* Page Header */}
@@ -611,6 +694,31 @@ export default function EditShipmentPlan() {
               <div className="ml-3">
                 <p className="text-sm text-green-700 font-medium">Shipment plan updated successfully</p>
                 <p className="text-sm text-green-600 mt-1">{actionData.success}</p>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {unmappingRequested && (
+          <div className="max-w-5xl mx-auto mb-6">
+            <div className="bg-amber-50 border border-amber-200 rounded-lg p-4 flex items-center justify-between">
+              <div className="text-amber-800 text-sm">
+                Unmapping has been requested for this plan. Approve to unlink and split into individual available liner
+                bookings, or reject to keep the current linkage.
+              </div>
+              <div className="flex items-center gap-3">
+                <form method="post">
+                  <input type="hidden" name="approve_unmapping" value="true" />
+                  <Button type="submit" className="bg-green-600 hover:bg-green-700 text-white">
+                    Approve Unmapping
+                  </Button>
+                </form>
+                <form method="post">
+                  <input type="hidden" name="reject_unmapping" value="true" />
+                  <Button type="submit" variant="outline" className="border-red-300 text-red-700 bg-transparent">
+                    Reject Unmapping
+                  </Button>
+                </form>
               </div>
             </div>
           </div>

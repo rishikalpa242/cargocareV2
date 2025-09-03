@@ -1,9 +1,17 @@
 "use client"
 
 import type React from "react"
-
+import { Form } from "react-router"
 import type { LoaderFunctionArgs, ActionFunctionArgs, MetaFunction } from "react-router"
-import { useLoaderData, useNavigate, useNavigation, redirect, useActionData, useSearchParams, Link } from "react-router"
+import {
+  useLoaderData,
+  useNavigate,
+  useNavigation,
+  redirect,
+  useActionData,
+  useSearchParams,
+  Link,
+} from "react-router"
 import { requireAuth } from "~/lib/auth.server"
 import { prisma } from "~/lib/prisma.server"
 import { Button } from "~/components/ui/button"
@@ -390,6 +398,31 @@ export async function action({ request }: ActionFunctionArgs) {
       }
     }
 
+    // New: support bulk delete for shipment assignments tab
+    if (action === "bulkDeleteAssignments") {
+      const selectedIds = formData.getAll("selectedIds") as string[]
+      if (selectedIds.length === 0) {
+        return { error: "No assignments selected" }
+      }
+
+      // Non-admin users cannot delete others' assignments if you enforce ownership (optional).
+      // Since assignments don't store userId in this file's context, we only gate by role at top.
+
+      const result = await prisma.$transaction(async (tx) => {
+        // Unlink assignments from shipment plans before deletion (avoid FK issues)
+        await tx.shipmentPlan.updateMany({
+          where: { shipmentAssignmentId: { in: selectedIds } },
+          data: { shipmentAssignmentId: null },
+        })
+        const deleted = await tx.shipmentAssignment.deleteMany({
+          where: { id: { in: selectedIds } },
+        })
+        return deleted.count
+      })
+
+      return { success: `${result} shipment assignment(s) deleted successfully` }
+    }
+
     return { error: "Invalid action" }
   } catch (error) {
     console.error("Error in liner bookings action:", error)
@@ -451,13 +484,47 @@ export default function LinerBookings() {
 
   const isLoading = navigation.state === "loading" || navigation.state === "submitting"
 
+  const rows =
+    availableColumns.length === 0
+      ? []
+      : isAssignments
+        ? linerBookings
+        : linerBookings.flatMap((booking: any) => {
+            const details = booking?.data?.liner_booking_details || []
+            if (!Array.isArray(details) || details.length === 0) {
+              return booking
+            }
+            return details.flatMap((d: any, i: number) => {
+              // Expand quantity into individual rows if provided, default to 1
+              const qty = Number.parseInt(d?.equipment_quantity || "1") || 1
+              return Array.from({ length: qty }, (_, k) => ({
+                // clone booking but ensure the UI reads this single detail via [0]
+                ...booking,
+                id: `${booking.id}#${i}-${k}`, // unique row key while still navigating to original booking
+                data: {
+                  ...booking.data,
+                  liner_booking_details: [d],
+                },
+                // preserve a pointer to original id for row click navigation if needed
+                __originalId: booking.id,
+              }))
+            })
+          })
+
   const handleRowClick = (id: string, event: React.MouseEvent) => {
     const target = event.target as HTMLElement
     const isInteractiveElement = target.closest('button, a, input, [role="checkbox"]')
     if (!isInteractiveElement) {
-      const dest = isAssignments ? `/liner-bookings/${id}/edit?assignmentId=${id}` : `/liner-bookings/${id}/edit`
+      const originalId =
+        typeof id === "string" && id.includes("#")
+          ? (rows.find((r: any) => r.id === id)?.__originalId ?? id.split("#")[0])
+          : id
+      const dest = isAssignments
+        ? `/liner-bookings/${originalId}/edit?assignmentId=${originalId}`
+        : `/liner-bookings/${originalId}/edit`
       console.log("[v0] handleRowClick:", {
         id,
+        originalId,
         isAssignments,
         dest,
         pathname: window.location.pathname,
@@ -477,7 +544,7 @@ export default function LinerBookings() {
 
   const handleSelectAll = (checked: boolean) => {
     if (checked) {
-      setSelectedBookings(linerBookings.map((booking: any) => booking.id))
+      setSelectedBookings(rows.map((booking: any) => booking.id))
     } else {
       setSelectedBookings([])
     }
@@ -702,6 +769,11 @@ export default function LinerBookings() {
     }
   }
 
+  const isSubmitting = navigation.state === "submitting"
+  const idsForDelete = Array.from(
+    new Set(selectedBookings.map((id) => (typeof id === "string" && id.includes("#") ? id.split("#")[0] : id))),
+  )
+
   return (
     <AdminLayout user={user}>
       {/* Page Header */}
@@ -742,8 +814,8 @@ export default function LinerBookings() {
           <div className="px-6 py-4 border-b border-gray-200 bg-gradient-to-r from-gray-50 to-white">
             <div className="flex items-center justify-between">
               <div className="flex items-center space-x-3">
-                <div className="w-8 h-8 bg-blue-100 rounded-lg flex items-center justify-center">
-                  <span className="text-blue-600 text-sm">🚢</span>
+                <div className="w-8 h-8 bg-blue-100 rounded-lg flex items-center justify-center mx-auto mb-4">
+                  <span className="text-blue-600 text-2xl">🚢</span>
                 </div>
                 <div>
                   <h3 className="text-lg font-semibold text-gray-900">
@@ -766,11 +838,27 @@ export default function LinerBookings() {
                 <div className="text-sm text-gray-600 bg-gray-50 px-3 py-2 rounded-lg">
                   <span className="font-medium">{totalCount}</span> {isAssignments ? "assignments" : "available"}
                 </div>
+                {idsForDelete.length > 0 && (
+                  <Form method="post">
+                    <input type="hidden" name="action" value={isAssignments ? "bulkDeleteAssignments" : "bulkDelete"} />
+                    {idsForDelete.map((id) => (
+                      <input key={id} type="hidden" name="selectedIds" value={id} />
+                    ))}
+                    <Button
+                      type="submit"
+                      className="bg-red-500 hover:bg-red-600 text-white"
+                      disabled={isSubmitting}
+                      size="sm"
+                    >
+                      {isSubmitting ? "Deleting..." : "Delete Selected"}
+                    </Button>
+                  </Form>
+                )}
               </div>
             </div>
           </div>
 
-          {linerBookings.length === 0 ? (
+          {rows.length === 0 ? (
             <div className="p-12 text-center">
               <div className="w-16 h-16 bg-blue-100 rounded-full flex items-center justify-center mx-auto mb-4">
                 <span className="text-blue-600 text-2xl">🚢</span>
@@ -802,7 +890,7 @@ export default function LinerBookings() {
                           <TableHead key={columnId} className="w-12 pl-6">
                             <div onClick={(event) => event.stopPropagation()}>
                               <Checkbox
-                                checked={selectedBookings.length === linerBookings.length && linerBookings.length > 0}
+                                checked={selectedBookings.length === rows.length && rows.length > 0}
                                 onChange={(e) => handleSelectAll(e.target.checked)}
                               />
                             </div>
@@ -819,7 +907,7 @@ export default function LinerBookings() {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {linerBookings.map((booking) => (
+                  {rows.map((booking) => (
                     <TableRow
                       key={booking.id}
                       className="hover:bg-gray-50 cursor-pointer transition-colors duration-150"
