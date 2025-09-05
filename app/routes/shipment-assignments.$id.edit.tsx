@@ -77,16 +77,161 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
       },
     }
 
-    const [availableShipmentPlans, carriers, vessels, organizations] = await Promise.all([
-      prisma.shipmentPlan.findMany({
-        where: { linkedStatus: 0 },
-        select: { id: true, data: true, createdAt: true },
-        orderBy: { createdAt: "desc" },
-      }),
-      prisma.carrier.findMany({ orderBy: { name: "asc" } }),
-      prisma.vessel.findMany({ orderBy: { name: "asc" } }),
-      prisma.organization.findMany({ orderBy: { name: "asc" } }),
-    ])
+    const assignmentData = (assignment.data as any) || {}
+    const assignmentStatus = assignmentData.carrier_booking_status || "Awaiting MD Approval"
+    console.log("[v0] shipment-assignments loader: assignment status", { assignmentStatus, assignmentId: id })
+
+    const [availableShipmentPlans, carriers, vessels, organizations, equipment, availableLinerBookings] =
+      await Promise.all([
+        prisma.shipmentPlan.findMany({
+          where: { linkedStatus: 0 },
+          select: { id: true, data: true, createdAt: true },
+          orderBy: { createdAt: "desc" },
+        }),
+        prisma.carrier.findMany({ orderBy: { name: "asc" } }),
+        prisma.vessel.findMany({ orderBy: { name: "asc" } }),
+        prisma.organization.findMany({ orderBy: { name: "asc" } }),
+        prisma.equipment.findMany({ orderBy: { name: "asc" } }),
+        prisma.linerBooking.findMany({
+          where: {
+            OR: [
+              { shipmentPlanId: null }, // Available bookings (not linked to any plan)
+              // Only include bookings linked to current shipment if assignment is not booked
+              ...(assignmentStatus !== "Booked"
+                ? [
+                    {
+                      shipmentPlanId: assignment.shipmentPlan?.id,
+                    },
+                  ]
+                : []),
+            ],
+          },
+          select: {
+            id: true,
+            createdAt: true,
+            data: true,
+            shipmentPlanId: true, // Include to identify linked bookings
+            user: { select: { id: true, name: true } },
+          },
+          orderBy: { createdAt: "desc" },
+        }),
+      ])
+
+    console.log("[v0] shipment-assignments loader: raw bookings query result", {
+      totalBookings: availableLinerBookings.length,
+      assignmentStatus,
+      shipmentPlanId: assignment.shipmentPlan?.id,
+      bookingsLinkedToCurrent: availableLinerBookings.filter((b) => b.shipmentPlanId === assignment.shipmentPlan?.id)
+        .length,
+      bookingsUnlinked: availableLinerBookings.filter((b) => b.shipmentPlanId === null).length,
+    })
+
+    let filteredAvailableLinerBookings = availableLinerBookings
+    try {
+      const planData = (assignment?.shipmentPlan?.data as any) ?? {}
+      const requiredEquipmentArr = Array.isArray(planData?.equipment_details) ? planData.equipment_details : []
+      const requiredTypes = new Set(
+        requiredEquipmentArr
+          .map((e: any) => e?.equipment_type)
+          .filter((t: any) => typeof t === "string" && t.trim() !== ""),
+      )
+
+      console.log("[v0] shipment-assignments loader: filtering criteria", {
+        requiredTypes: Array.from(requiredTypes),
+        assignmentStatus,
+        shipmentPlanId: assignment.shipmentPlan?.id,
+      })
+
+      const allowedStatuses = new Set([
+        "available",
+        "ready for re-linking",
+        "ready for re‑linking", // include variant with non-breaking hyphen, if present
+      ])
+
+      filteredAvailableLinerBookings = availableLinerBookings.filter((b: any) => {
+        const statusRaw = (b?.data?.carrier_booking_status ?? "").toString()
+        const status = statusRaw.toLowerCase()
+        const isLinkedToCurrent = b.shipmentPlanId === assignment.shipmentPlan?.id
+
+        console.log("[v0] shipment-assignments loader: filtering booking", {
+          bookingId: b.id,
+          status: statusRaw,
+          isLinkedToCurrent,
+          assignmentStatus,
+          shipmentPlanId: b.shipmentPlanId,
+        })
+
+        if (isLinkedToCurrent && assignmentStatus === "Booked") {
+          console.log("[v0] shipment-assignments loader: EXCLUDING booked linked booking", {
+            bookingId: b.id,
+            status: statusRaw,
+            assignmentStatus,
+            reason: "Assignment is already booked",
+          })
+          return false
+        }
+
+        const statusOk = isLinkedToCurrent || status === "" || allowedStatuses.has(status)
+
+        if (!statusOk) {
+          console.log("[v0] shipment-assignments loader: EXCLUDING booking due to status", {
+            bookingId: b.id,
+            status: statusRaw,
+            isLinkedToCurrent,
+            allowedStatuses: Array.from(allowedStatuses),
+            reason: "Status not allowed",
+          })
+          return false
+        }
+
+        if (requiredTypes.size === 0) {
+          console.log("[v0] shipment-assignments loader: INCLUDING booking (no equipment filter)", {
+            bookingId: b.id,
+            status: statusRaw,
+          })
+          return true
+        }
+
+        const ed: any[] = Array.isArray(b?.data?.equipment_details) ? b.data.equipment_details : []
+        const lbd: any[] = Array.isArray(b?.data?.liner_booking_details) ? b.data.liner_booking_details : []
+
+        const typesFromED = ed
+          .map((e) => (typeof e?.equipment_type === "string" ? e.equipment_type.trim() : ""))
+          .filter((t) => t.length > 0)
+
+        const typesFromLBD = lbd
+          .map((d) => (typeof d?.equipment_type === "string" ? d.equipment_type.split("|")[0].trim() : ""))
+          .filter((t) => t.length > 0)
+
+        const bookingTypes = new Set<string>([...typesFromED, ...typesFromLBD])
+
+        console.log("[v0] shipment-assignments loader: equipment type matching", {
+          bookingId: b.id,
+          bookingTypes: Array.from(bookingTypes),
+          requiredTypes: Array.from(requiredTypes),
+        })
+
+        // Intersect bookingTypes with requiredTypes
+        for (const t of bookingTypes) {
+          if (requiredTypes.has(t)) {
+            console.log("[v0] shipment-assignments loader: INCLUDING booking (equipment match)", {
+              bookingId: b.id,
+              matchedType: t,
+            })
+            return true
+          }
+        }
+
+        console.log("[v0] shipment-assignments loader: EXCLUDING booking (no equipment match)", {
+          bookingId: b.id,
+          bookingTypes: Array.from(bookingTypes),
+          requiredTypes: Array.from(requiredTypes),
+        })
+        return false
+      })
+    } catch (e) {
+      console.error("[v0] loader: filtering availableLinerBookings by status/type failed", e)
+    }
 
     console.log("[v0] shipment-assignments loader success", {
       id: assignment.id,
@@ -95,14 +240,20 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
       vessels: vessels.length,
       organizations: organizations.length,
       availablePlans: availableShipmentPlans.length,
+      availableBookings: filteredAvailableLinerBookings.length,
+      assignmentStatus,
+      totalBookingsBeforeFilter: availableLinerBookings.length,
+      filteredOut: availableLinerBookings.length - filteredAvailableLinerBookings.length,
     })
 
     return {
       user,
       linerBooking: linerBookingShape,
       availableShipmentPlans,
-      dataPoints: { carriers, vessels, organizations },
+      availableLinerBookings: filteredAvailableLinerBookings,
+      dataPoints: { carriers, vessels, organizations, equipment },
       context: "shipment-assignment",
+      isAssignment: true,
     }
   } catch (error) {
     console.error("[v0] Error loading shipment assignment:", error)
@@ -213,13 +364,15 @@ export async function action({ request, params }: ActionFunctionArgs) {
 }
 
 export default function EditShipmentAssignmentPage() {
-  const { user, linerBooking, availableShipmentPlans, dataPoints } = useLoaderData<typeof loader>()
+  const { user, linerBooking, availableShipmentPlans, dataPoints, availableLinerBookings, isAssignment } =
+    useLoaderData<typeof loader>()
   const actionData = useActionData<typeof action>()
 
   console.log("[v0] EditShipmentAssignmentPage render", {
     linerBookingId: linerBooking?.id,
     hasPlan: !!linerBooking?.shipmentPlan,
     userId: user?.id,
+    availableBookingsCount: availableLinerBookings?.length || 0,
   })
 
   return (
@@ -231,6 +384,8 @@ export default function EditShipmentAssignmentPage() {
         dataPoints={dataPoints}
         actionData={actionData}
         user={user}
+        availableLinerBookings={availableLinerBookings}
+        isAssignment={isAssignment}
       />
     </AdminLayout>
   )

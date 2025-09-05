@@ -80,12 +80,16 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
           prisma.equipment.findMany({ orderBy: { name: "asc" } }), // include equipment for edit UI fallback
           prisma.linerBooking.findMany({
             where: {
-              shipmentPlanId: null,
+              OR: [
+                { shipmentPlanId: null }, // Available bookings
+                { shipmentPlanId: assignment.shipmentPlan?.id }, // Bookings linked to current shipment
+              ],
             },
             select: {
               id: true,
               createdAt: true,
               data: true,
+              shipmentPlanId: true, // Include to identify linked bookings
               user: { select: { id: true, name: true } },
             },
             orderBy: { createdAt: "desc" },
@@ -110,8 +114,11 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
 
         filteredAvailableLinerBookings = availableLinerBookings.filter((b: any) => {
           const statusRaw = (b?.data?.carrier_booking_status ?? "").toString()
-          const status = statusRaw.toLowerCase()
-          const statusOk = status === "" || allowedStatuses.has(status)
+  const status = statusRaw.toLowerCase()
+
+  const isLinkedToCurrent = b.shipmentPlanId === assignment.shipmentPlan?.id
+  // Only show truly unlinked bookings OR those linked to current assignment
+  const statusOk = (b.shipmentPlanId === null && (status === "" || allowedStatuses.has(status))) || isLinkedToCurrent
 
           if (!statusOk) return false
 
@@ -340,6 +347,118 @@ export async function action({ request, params }: ActionFunctionArgs) {
       detailIndex++
     }
 
+    if (assignmentId && specialAction === "unlink_booking") {
+      const bookingIdToUnlink = formData.get("bookingId") as string
+      if (!bookingIdToUnlink) {
+        return redirect(`/liner-bookings/${params.id}/edit?assignmentId=${assignmentId}`)
+      }
+
+      console.log("[v0] unlink_booking action started", { bookingIdToUnlink, assignmentId })
+
+      const current = await prisma.shipmentAssignment.findUnique({
+        where: { id: assignmentId },
+        include: { shipmentPlan: true },
+      })
+      if (!current || !current.shipmentPlan) {
+        return Response.json({ error: "Shipment assignment or linked shipment plan not found" }, { status: 404 })
+      }
+
+      // Check if assignment is already booked (unlinking not allowed)
+      const assignmentData = (current.data as any) || {}
+      if (assignmentData.carrier_booking_status === "Booked") {
+        return Response.json({ error: "Cannot unlink bookings from a booked assignment" }, { status: 400 })
+      }
+
+      // Get the booking to unlink
+      const bookingToUnlink = await prisma.linerBooking.findUnique({
+        where: { id: bookingIdToUnlink },
+      })
+      if (!bookingToUnlink) {
+        return Response.json({ error: "Booking not found" }, { status: 404 })
+      }
+
+      console.log("[v0] unlink_booking - booking found", {
+        bookingId: bookingToUnlink.id,
+        bookingDetailsCount: ((bookingToUnlink.data as any)?.liner_booking_details || []).length,
+      })
+
+      // Remove the booking's details from the assignment's liner_booking_details
+      const existingDetails = Array.isArray(assignmentData.liner_booking_details)
+        ? assignmentData.liner_booking_details
+        : []
+
+      console.log("[v0] unlink_booking - existing details in assignment", {
+        existingDetailsCount: existingDetails.length,
+        existingDetails: existingDetails.map((d: any) => ({
+          temp_booking: d?.temporary_booking_number,
+          liner_booking: d?.liner_booking_number,
+        })),
+      })
+
+      const bookingDetails = ((bookingToUnlink.data as any)?.liner_booking_details || []) as any[]
+      const bookingDetailKeys = new Set(
+        bookingDetails.map(
+          (d: any) => (d?.temporary_booking_number || d?.liner_booking_number || JSON.stringify(d)) as string,
+        ),
+      )
+
+      console.log("[v0] unlink_booking - booking detail keys to remove", {
+        bookingDetailKeys: Array.from(bookingDetailKeys),
+        bookingDetailsCount: bookingDetails.length,
+      })
+
+      const updatedDetails = existingDetails.filter((detail: any) => {
+        const key = (detail?.temporary_booking_number ||
+          detail?.liner_booking_number ||
+          JSON.stringify(detail)) as string
+        const shouldKeep = !bookingDetailKeys.has(key)
+        console.log("[v0] unlink_booking - filtering detail", {
+          detailKey: key,
+          shouldKeep,
+          temp_booking: detail?.temporary_booking_number,
+          liner_booking: detail?.liner_booking_number,
+        })
+        return shouldKeep
+      })
+
+      console.log("[v0] unlink_booking - after filtering", {
+        originalCount: existingDetails.length,
+        updatedCount: updatedDetails.length,
+        removedCount: existingDetails.length - updatedDetails.length,
+      })
+
+      // Transaction: unlink booking and update assignment
+      await prisma.$transaction(async (tx) => {
+        // Unlink the booking and set status to make it available again
+        const bookingData = (bookingToUnlink.data as any) || {}
+        await tx.linerBooking.update({
+          where: { id: bookingIdToUnlink },
+          data: {
+            shipmentPlanId: null,
+            data: {
+              ...bookingData,
+              carrier_booking_status: "Ready for Re-linking",
+            },
+          },
+        })
+
+        // Update assignment with filtered details
+        await tx.shipmentAssignment.update({
+          where: { id: assignmentId },
+          data: {
+            data: {
+              ...assignmentData,
+              liner_booking_details: updatedDetails,
+            } as any,
+          },
+        })
+      })
+
+      console.log("[v0] unlink_booking - transaction completed, redirecting")
+
+      return redirect(`/liner-bookings/${params.id}/edit?assignmentId=${assignmentId}`)
+    }
+
     if (assignmentId && specialAction === "link_available") {
       const selectedIds = formData.getAll("selectedAvailableIds") as string[]
       if (selectedIds.length === 0) {
@@ -380,19 +499,26 @@ export async function action({ request, params }: ActionFunctionArgs) {
         }
       }
 
-      // Transaction: link bookings to shipment plan, mark as Booked, update assignment and mark plan as linked
-      await prisma.$transaction(async (tx) => {
-        for (const b of bookings) {
-          const data = (b.data as any) || {}
-          data.carrier_booking_status = "Booked"
-          await tx.linerBooking.update({
-            where: { id: b.id },
-            data: {
-              shipmentPlanId: current.shipmentPlan!.id,
-              data,
-            },
-          })
-        }
+      // Transaction: link bookings to shipment plan, update assignment and mark plan as linked
+      // Transaction: link bookings to shipment plan, update assignment and mark plan as linked
+await prisma.$transaction(async (tx) => {
+  for (const b of bookings) {
+    const data = (b.data as any) || {}
+    // Ensure the booking data maintains its status when being linked
+    await tx.linerBooking.update({
+      where: { id: b.id },
+      data: {
+        shipmentPlanId: current.shipmentPlan!.id,
+        data: {
+          ...data,
+          // Keep existing status unless it's "Ready for Re-linking"
+          carrier_booking_status: data.carrier_booking_status === "Ready for Re-linking" 
+            ? "Awaiting MD Approval" 
+            : (data.carrier_booking_status || "Awaiting MD Approval")
+        },
+      },
+    })
+  }
 
         // Update assignment with merged details (do not force Booked status here)
         await tx.shipmentAssignment.update({
@@ -407,7 +533,7 @@ export async function action({ request, params }: ActionFunctionArgs) {
 
         // Ensure plan is marked as linked so loader doesn't clear details
         await tx.shipmentPlan.update({
-          where: { id: current.shipmentPlan.id },
+          where: { id: current.shipmentPlan!.id },
           data: {
             linkedStatus: 1,
           },
@@ -417,7 +543,96 @@ export async function action({ request, params }: ActionFunctionArgs) {
       return redirect(`/liner-bookings/${params.id}/edit?assignmentId=${assignmentId}`)
     }
 
-    // Assignment mode: update shipment_assignments and exit
+    if (assignmentId && specialAction === "allocate_individual") {
+      const detailIndex = formData.get("detailIndex") as string
+      if (!detailIndex) {
+        return redirect(`/liner-bookings/${params.id}/edit?assignmentId=${assignmentId}`)
+      }
+
+      console.log("[v0] allocate_individual action started", { assignmentId, detailIndex })
+
+      const current = await prisma.shipmentAssignment.findUnique({
+        where: { id: assignmentId },
+        include: { shipmentPlan: true },
+      })
+      if (!current || !current.shipmentPlan) {
+        return Response.json({ error: "Shipment assignment or linked shipment plan not found" }, { status: 404 })
+      }
+
+      // Check if assignment is already booked
+      const assignmentData = (current.data as any) || {}
+      if (assignmentData.carrier_booking_status === "Booked") {
+        return Response.json({ error: "Cannot allocate to a booked assignment" }, { status: 400 })
+      }
+
+      // Get the specific booking detail to allocate
+      const detailIndexNum = Number.parseInt(detailIndex, 10)
+      if (detailIndexNum >= 0 && detailIndexNum < linerBookingDetails.length) {
+        const detailToAllocate = linerBookingDetails[detailIndexNum]
+
+        // Update the existing liner_booking_details array or create new one
+        const existingDetails = Array.isArray(assignmentData.liner_booking_details)
+          ? assignmentData.liner_booking_details
+          : []
+
+        // Add the allocated detail (mark it as allocated somehow)
+        const updatedDetails = [...existingDetails]
+        updatedDetails[detailIndexNum] = { ...detailToAllocate, allocated: true }
+
+        const updatedData = {
+          ...assignmentData,
+          liner_booking_details: updatedDetails,
+        }
+
+        await prisma.shipmentAssignment.update({
+          where: { id: assignmentId },
+          data: {
+            data: updatedData as any,
+          },
+        })
+
+        console.log("[v0] allocate_individual - allocation completed for detail", detailIndexNum)
+      }
+
+      return redirect(`/liner-bookings/${params.id}/edit?assignmentId=${assignmentId}`)
+    }
+
+    if (assignmentId && specialAction === "allocate_requested") {
+      console.log("[v0] allocate_requested action started", { assignmentId })
+
+      const current = await prisma.shipmentAssignment.findUnique({
+        where: { id: assignmentId },
+        include: { shipmentPlan: true },
+      })
+      if (!current || !current.shipmentPlan) {
+        return Response.json({ error: "Shipment assignment or linked shipment plan not found" }, { status: 404 })
+      }
+
+      // Check if assignment is already booked
+      const assignmentData = (current.data as any) || {}
+      if (assignmentData.carrier_booking_status === "Booked") {
+        return Response.json({ error: "Cannot allocate to a booked assignment" }, { status: 400 })
+      }
+
+      // Update assignment with the requested booking details
+      const updatedData = {
+        ...assignmentData,
+        ...(carrier_booking_status ? { carrier_booking_status } : {}),
+        ...(typeof unmapping_request === "boolean" ? { unmapping_request } : {}),
+        ...(unmapping_reason ? { unmapping_reason } : {}),
+        ...(booking_released_to ? { booking_released_to } : {}),
+        ...(linerBookingDetails.length > 0 ? { liner_booking_details: linerBookingDetails } : {}),
+      }
+
+      await prisma.shipmentAssignment.update({
+        where: { id: assignmentId },
+        data: { data: updatedData },
+      })
+
+      console.log("[v0] allocate_requested - allocation completed")
+      return redirect(`/liner-bookings/${params.id}/edit?assignmentId=${assignmentId}`)
+    }
+
     if (assignmentId) {
       console.log("[v0] action: assignment mode")
       const allBookingAssigned = formData.get("all_booking_assigned") === "true"
@@ -444,74 +659,92 @@ export async function action({ request, params }: ActionFunctionArgs) {
       }
 
       if (allBookingAssigned) {
-        console.log("[v0] assignment: All Booking Assigned flow")
-        updatedData.carrier_booking_status = "Booked"
+  console.log("[v0] assignment: All Booking Assigned flow")
+  updatedData.carrier_booking_status = "Booked"
 
-        await prisma.shipmentAssignment.update({
-          where: { id: assignmentId },
-          data: { data: updatedData },
+  console.log("[v0] assignment: updating assignment status to Booked", {
+    assignmentId,
+    previousStatus: existingData?.carrier_booking_status,
+    newStatus: "Booked",
+  })
+
+  // Use transaction to ensure all updates happen atomically
+  await prisma.$transaction(async (tx) => {
+    // Update the assignment
+    await tx.shipmentAssignment.update({
+      where: { id: assignmentId },
+      data: { data: updatedData },
+    })
+
+    if (current.shipmentPlan) {
+      const spData = ((current.shipmentPlan.data as any) || {}) as any
+      const prevStatus = spData.booking_status
+      spData.booking_status = "Booked"
+
+      console.log("[v0] assignment: updating shipment plan status", {
+        shipmentPlanId: current.shipmentPlan.id,
+        previousStatus: prevStatus,
+        newStatus: "Booked",
+      })
+
+      // Update shipment plan
+      await tx.shipmentPlan.update({
+        where: { id: current.shipmentPlan.id },
+        data: { data: spData, linkedStatus: 1 },
+      })
+
+      // Update status of currently linked liner bookings to "Booked" but don't delete them
+      // Only update bookings that are actually still linked (shipmentPlanId matches)
+      console.log("[v0] assignment: updating linked liner bookings status to Booked", {
+        shipmentPlanId: current.shipmentPlan.id,
+      })
+
+      const linkedBookingsToUpdate = await tx.linerBooking.findMany({
+        where: { shipmentPlanId: current.shipmentPlan.id },
+        select: { id: true, data: true }
+      })
+
+      console.log("[v0] assignment: found linked bookings to update", {
+        count: linkedBookingsToUpdate.length,
+        bookingIds: linkedBookingsToUpdate.map(b => b.id)
+      })
+
+      // Update each linked booking's status to "Booked"
+      for (const booking of linkedBookingsToUpdate) {
+        const bookingData = (booking.data as any) || {}
+        await tx.linerBooking.update({
+          where: { id: booking.id },
+          data: {
+            data: {
+              ...bookingData,
+              carrier_booking_status: "Booked",
+            },
+          },
         })
+      }
 
-        if (current.shipmentPlan) {
-          const spData = ((current.shipmentPlan.data as any) || {}) as any
-          const prevStatus = spData.booking_status
-          spData.booking_status = "Booked"
-          await prisma.shipmentPlan.update({
-            where: { id: current.shipmentPlan.id },
-            data: { data: spData, linkedStatus: 1 },
-          })
-          console.log("[v0] assignment: updated shipmentPlan booked", {
-            shipmentPlanId: current.shipmentPlan.id,
-            prevStatus,
-            newStatus: spData.booking_status,
-          })
-        }
+      console.log("[v0] assignment: linked liner bookings status updated to Booked")
+    }
+  })
 
-        try {
-          const detailsToMatch =
-            (linerBookingDetails?.length ?? 0) > 0 ? linerBookingDetails : (updatedData?.liner_booking_details ?? [])
+        // DISABLED: Cleanup logic that was incorrectly deleting properly unlinked bookings
+        // This logic was intended to clean up "orphaned placeholders" but was actually
+        // deleting legitimate unlinked bookings that users want to keep available.
+        //
+        // The problem: This logic couldn't distinguish between:
+        // 1. Legitimate unlinked bookings (user clicked Unlink and wants to keep them available)
+        // 2. Temporary placeholder bookings that should be cleaned up
+        //
+        // Since preserving user data is more important than cleanup, we're disabling this.
+        
+        console.log("[v0] assignment: skipping cleanup of orphaned bookings to preserve unlinked bookings")
+        
+        // Future cleanup logic should:
+        // 1. Have explicit markers to identify temporary vs. permanent bookings
+        // 2. Require user confirmation before deletion
+        // 3. Run as a separate maintenance process, not during normal operations
 
-          if (Array.isArray(detailsToMatch) && detailsToMatch.length > 0) {
-            // Load only unlinked (available) liner bookings and filter in code by status + matching equipment details
-            const orphanedBookings = await prisma.linerBooking.findMany({
-              where: {
-                shipmentPlanId: null, // temporary "available" entries are unlinked
-                id: { not: id }, // safety: exclude current route id param if it exists
-              },
-            })
-
-            const bookingsToDelete = orphanedBookings.filter((orphanedBooking) => {
-              const orphanedData = orphanedBooking.data as any
-              return (
-                orphanedData?.carrier_booking_status === "Ready for Re-linking" &&
-                Array.isArray(orphanedData?.liner_booking_details) &&
-                orphanedData.liner_booking_details.some((orphanedDetail: any) =>
-                  detailsToMatch.some(
-                    (currentDetail: any) =>
-                      orphanedDetail?.temporary_booking_number === currentDetail?.temporary_booking_number ||
-                      orphanedDetail?.liner_booking_number === currentDetail?.liner_booking_number,
-                  ),
-                )
-              )
-            })
-
-            if (bookingsToDelete.length > 0) {
-              console.log(
-                `[v0] assignment: deleting ${bookingsToDelete.length} orphan 'Ready for Re-linking' placeholder(s) after re-allocation`,
-              )
-              await prisma.linerBooking.deleteMany({
-                where: { id: { in: bookingsToDelete.map((b) => b.id) } },
-              })
-            } else {
-              console.log("[v0] assignment: no orphan placeholders found to delete after re-allocation")
-            }
-          } else {
-            console.log("[v0] assignment: no liner_booking_details in payload to match placeholders")
-          }
-        } catch (cleanupErr) {
-          console.error("[v0] assignment: cleanup placeholders failed", cleanupErr)
-        }
-
+        console.log("[v0] assignment: All Booking Assigned flow completed, redirecting")
         return redirect("/liner-bookings?tab=assignments")
       }
 
@@ -589,67 +822,48 @@ export async function action({ request, params }: ActionFunctionArgs) {
 
       console.log("Liner booking updated. Has shipment plan:", !!updatedLinerBooking.shipmentPlan)
 
-      // Clean up orphaned "Ready for Re-linking" entries that match this booking's equipment
-      const currentData = updatedLinerBooking.data as any
-      if (currentData.liner_booking_details && Array.isArray(currentData.liner_booking_details)) {
-        // Find all "Ready for Re-linking" entries with matching equipment details
-        const orphanedBookings = await prisma.linerBooking.findMany({
-          where: {
-            shipmentPlanId: null, // Unlinked entries
-            id: { not: id }, // Exclude current booking
-          },
-        })
+      // DISABLED: Clean up logic that was incorrectly deleting properly unlinked bookings
+      // The issue was that this logic couldn't distinguish between:
+      // 1. Legitimate unlinked bookings that users want to keep available
+      // 2. Actual duplicate temporary bookings that should be cleaned up
+      //
+      // Since unlinked bookings should remain available for re-use, we're disabling
+      // this cleanup logic to prevent accidental deletion of user data.
+      
+      console.log("Skipping cleanup of temporary bookings to preserve unlinked bookings")
+      
+      // If cleanup becomes necessary in the future, it should be implemented with:
+      // 1. More specific criteria to identify true duplicates vs. legitimate unlinked bookings
+      // 2. User confirmation before deletion
+      // 3. A separate cleanup process that doesn't run during normal operations
 
-        // Filter orphaned bookings that have matching equipment details
-        const bookingsToDelete = orphanedBookings.filter((orphanedBooking) => {
-          const orphanedData = orphanedBooking.data as any
-          return (
-            orphanedData.carrier_booking_status === "Ready for Re-linking" &&
-            orphanedData.liner_booking_details &&
-            Array.isArray(orphanedData.liner_booking_details) &&
-            orphanedData.liner_booking_details.some((orphanedDetail: any) =>
-              currentData.liner_booking_details.some(
-                (currentDetail: any) =>
-                  orphanedDetail.temporary_booking_number === currentDetail.temporary_booking_number ||
-                  orphanedDetail.liner_booking_number === currentDetail.liner_booking_number,
-              ),
-            )
-          )
-        })
-
-        if (bookingsToDelete.length > 0) {
-          console.log(`Found ${bookingsToDelete.length} orphaned "Ready for Re-linking" entries to delete`)
-
-          await prisma.linerBooking.deleteMany({
-            where: {
-              id: { in: bookingsToDelete.map((booking) => booking.id) },
-            },
-          })
-
-          console.log("Orphaned Ready for Re-linking entries deleted successfully")
-        }
-      }
-
-      // Delete duplicate liner bookings with the same shipmentPlanId
+      // Update status of other linked liner bookings to "Booked" but don't delete them
       if (updatedLinerBooking.shipmentPlan) {
-        const duplicateLinerBookings = await prisma.linerBooking.findMany({
+        const otherLinkedBookings = await prisma.linerBooking.findMany({
           where: {
             shipmentPlanId: updatedLinerBooking.shipmentPlan.id,
             id: { not: id }, // Exclude the current liner booking
           },
         })
 
-        if (duplicateLinerBookings.length > 0) {
-          console.log(`Found ${duplicateLinerBookings.length} duplicate liner bookings to delete`)
+        if (otherLinkedBookings.length > 0) {
+          console.log(`Found ${otherLinkedBookings.length} other linked liner bookings to update status`)
 
-          await prisma.linerBooking.deleteMany({
-            where: {
-              shipmentPlanId: updatedLinerBooking.shipmentPlan.id,
-              id: { not: id }, // Exclude the current liner booking
-            },
-          })
+          // Update each booking's status to "Booked"
+          for (const booking of otherLinkedBookings) {
+            const bookingData = (booking.data as any) || {}
+            await prisma.linerBooking.update({
+              where: { id: booking.id },
+              data: {
+                data: {
+                  ...bookingData,
+                  carrier_booking_status: "Booked",
+                },
+              },
+            })
+          }
 
-          console.log("Duplicate liner bookings deleted successfully")
+          console.log("Other linked liner bookings status updated to Booked")
         }
       }
 

@@ -293,21 +293,28 @@ export async function action({ request, params }: ActionFunctionArgs) {
         }
       }
 
-      // Update the original linked record to Awaiting Booking and clear unmapping flags
+      // Delete the original linked bookings since we've created individual ones
       if (linkedType === "linerBooking") {
-        await prisma.linerBooking.update({
-          where: { id: currentPlan.linerBooking!.id },
-          data: {
-            data: {
-              ...originalData,
-              carrier_booking_status: "Awaiting Booking",
-              unmapping_request: false,
-              unmapping_reason: "",
-            },
-            // keep relation as-is (mirrors previous behavior); plan will be unlinked via linkedStatus below
-            shipmentPlanId: currentPlan.id,
-          },
+        // Find and delete ALL liner bookings linked to this shipment plan
+        // This includes the main booking and any others created during "All Booking Assigned"
+        const allLinkedBookings = await prisma.linerBooking.findMany({
+          where: { shipmentPlanId: currentPlan.id },
+          select: { id: true }
         })
+
+        console.log("[v0] approve_unmapping: found all linked bookings to delete", {
+          count: allLinkedBookings.length,
+          bookingIds: allLinkedBookings.map(b => b.id)
+        })
+
+        // Delete all linked bookings since we've created individual ones above
+        if (allLinkedBookings.length > 0) {
+          await prisma.linerBooking.deleteMany({
+            where: { shipmentPlanId: currentPlan.id },
+          })
+
+          console.log("[v0] approve_unmapping: deleted all linked bookings")
+        }
       } else {
         const clearedAssignmentData = {
           ...originalData,
@@ -331,6 +338,27 @@ export async function action({ request, params }: ActionFunctionArgs) {
           assignmentId: currentPlan.shipmentAssignment!.id,
           planId,
         })
+
+        // Delete any liner bookings that were linked to this shipment plan during assignment
+        // since we've already created individual ones above
+        const linkedBookings = await prisma.linerBooking.findMany({
+          where: { shipmentPlanId: currentPlan.id },
+          select: { id: true }
+        })
+
+        console.log("[v0] approve_unmapping: found linked bookings for assignment to delete", {
+          count: linkedBookings.length,
+          bookingIds: linkedBookings.map(b => b.id)
+        })
+
+        // Delete all linked bookings since we've created individual ones above
+        if (linkedBookings.length > 0) {
+          await prisma.linerBooking.deleteMany({
+            where: { shipmentPlanId: currentPlan.id },
+          })
+
+          console.log("[v0] approve_unmapping: deleted linked bookings for assignment")
+        }
       }
 
       // Update shipment plan status and unlink marker

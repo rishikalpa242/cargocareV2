@@ -83,6 +83,10 @@ export async function loader({ request }: LoaderFunctionArgs) {
             equals: "Ready for Re-linking",
           },
         },
+        // Include unlinked bookings regardless of status
+        {
+          shipmentPlanId: null,
+        },
       ]
     }
 
@@ -489,7 +493,7 @@ export default function LinerBookings() {
       ? []
       : isAssignments
         ? linerBookings
-        : linerBookings.flatMap((booking: any) => {
+        : (linerBookings as any[]).flatMap((booking: any) => {
             const details = booking?.data?.liner_booking_details || []
             if (!Array.isArray(details) || details.length === 0) {
               return booking
@@ -907,7 +911,7 @@ export default function LinerBookings() {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {rows.map((booking) => (
+                  {rows.map((booking: any) => (
                     <TableRow
                       key={booking.id}
                       className="hover:bg-gray-50 cursor-pointer transition-colors duration-150"

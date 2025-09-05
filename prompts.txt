@@ -1,0 +1,12 @@
+you're an expert full stack developer with expertise in MERN stack, typescript, postgres SQL etc. Now the zip that I've shared with you has all the files of the cargocare project. There the flow of work goes like this the shipment team creates a shipment plan with all the necessary details and specially the Equipment type (which he selects from the dropdown list). Then after creation the MD approves that shipment plan, which creates a new entry in the Shipment Assignments tab. Then comes the role of the Liner Booking team. they've 3 options to work with the shipment Assignment. either they can assign liner Booking against that particular shipment assignment from the available liner bookings list or they can request completely new liner bookings for that shipment assignment or they can partially allocate some Equipments from the available liner bookings and for the rest of the Equipments required they can request some new liner bookings. You can see the code as well this is how the current flow works.
+
+
+now upto the MD approval and creation of the shipment assignment entry is working properly after which if the liner booking team clicks on the shipment assignment (http://localhost:5173/liner-bookings/cmf5bik92000duwi016y0pm17/edit?assignmentId=cmf5bik92000duwi016y0pm17) they get the Liner Booking details section which we need to rebuild and rework on it... since you already understand the flow of the work so there will be these 2 tabs request booking and Link available under which all the fields will be as it is. it's just that you need to check whether the liner booking team can do the operations just as I stated above... the 3 options that I already told you
+
+
+
+
+
+ok after applying these changes I'm gonna test all 3 use cases one by one 1st I'm testing if I can allocate all the requirements from the available liner bookings... I just checked and I can allocate all the required equipments from the available liner bookings list, no problems at all but the only thing is even though I am linking from the available liner bookings list and then clicking the All Booking Assigned button it is marking the assignment as booked with the allocated equipments but it is not clearing up the allocated entries from the Available Liner Bookings list (liner_bookings table)... check where is the issue and fix it accordingly so that the changes does the job but doesn't affect any other operations that is working fine
+
+

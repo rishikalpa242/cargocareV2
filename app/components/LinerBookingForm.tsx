@@ -52,10 +52,28 @@ export function LinerBookingForm({
   // Extract data from the JSON field for edit mode
   const data = mode === "edit" ? (linerBooking?.data as any) : null
 
-  // Initialize state for liner booking details
-  const [linerBookingDetails, setLinerBookingDetails] = useState(
-    mode === "edit" && data?.liner_booking_details ? data.liner_booking_details : [], // was: [ { ...default object... } ]
-  )
+  // Initialize state for liner booking details - only show manually requested ones in Request Booking tab
+  const [linerBookingDetails, setLinerBookingDetails] = useState(() => {
+    if (mode === "edit" && data?.liner_booking_details && isAssignment) {
+      // In assignment mode, filter out details that came from linked bookings
+      // We'll identify linked details by checking if they match any available liner booking details
+      const allDetails = data.liner_booking_details || []
+
+      // For now, start with empty array for Request Booking tab in assignment mode
+      // Linked booking details will be shown separately in the Link Available tab
+      return []
+    } else if (mode === "edit" && data?.liner_booking_details) {
+      return data.liner_booking_details
+    }
+    return []
+  })
+
+  const [requestedBookingDetails, setRequestedBookingDetails] = useState(() => {
+    if (mode === "edit" && data?.requested_booking_details) {
+      return data.requested_booking_details
+    }
+    return []
+  })
 
   const [openSections, setOpenSections] = useState(() => {
     if (mode === "edit") {
@@ -140,6 +158,7 @@ export function LinerBookingForm({
   const calculateAllocatedEquipment = () => {
     const allocated = {} as Record<string, number>
 
+    // No need to separately count linked bookings since their details are already merged into linerBookingDetails
     linerBookingDetails.forEach((detail: any) => {
       if (detail.equipment_type) {
         const [equipmentType] = detail.equipment_type.split("|")
@@ -148,6 +167,26 @@ export function LinerBookingForm({
     })
 
     return allocated
+  }
+
+  const getUnallocatedEquipmentTypes = () => {
+    if (mode !== "edit" || !linerBooking?.shipmentPlan) return []
+
+    const required = calculateRequiredEquipment()
+    const allocated = calculateAllocatedEquipment()
+    const unallocated: string[] = []
+
+    for (const [equipmentType, requiredQty] of Object.entries(required)) {
+      const allocatedQty = allocated[equipmentType] || 0
+      const remaining = requiredQty - allocatedQty
+
+      // Add equipment type for each remaining unit needed
+      for (let i = 0; i < remaining; i++) {
+        unallocated.push(equipmentType)
+      }
+    }
+
+    return unallocated
   }
 
   // Validate equipment allocation
@@ -227,6 +266,9 @@ export function LinerBookingForm({
       ? (linerBooking!.data as any).liner_booking_details
       : []
 
+    console.log("[v0] useEffect sync - current linerBookingDetails:", linerBookingDetails.length)
+    console.log("[v0] useEffect sync - nextDetails from server:", nextDetails.length)
+
     // Avoid unnecessary state churn if same length and same identity keys
     const sameLength = linerBookingDetails.length === nextDetails.length
     const sameKeys =
@@ -238,12 +280,16 @@ export function LinerBookingForm({
         return keyD === keyN
       })
 
+    console.log("[v0] useEffect sync - sameKeys:", sameKeys, "sameLength:", sameLength)
+
     if (!sameKeys) {
+      console.log("[v0] useEffect sync - updating state with nextDetails")
       setLinerBookingDetails(nextDetails)
+    } else {
+      console.log("[v0] useEffect sync - skipping update, keys are same")
     }
   }, [
     mode,
-    linerBookingDetails,
     (linerBooking?.data as any)?.liner_booking_details, // depend on the actual captured data instead of linerBooking?.id
   ])
 
@@ -324,26 +370,29 @@ export function LinerBookingForm({
   }
 
   const addLinerBookingDetail = () => {
-    setLinerBookingDetails([
-      ...linerBookingDetails,
-      {
-        original_planned_vessel: "",
-        e_t_d_of_original_planned_vessel: "",
-        change_in_original_vessel: false,
-        revised_vessel: "",
-        etd_of_revised_vessel: "",
-        empty_pickup_validity_from: "",
-        empty_pickup_validity_till: "",
-        estimate_gate_opening_date: "",
-        estimated_gate_cutoff_date: "",
-        s_i_cut_off_date: "",
-        booking_received_from_carrier_on: "",
-        additional_remarks: "",
-        line_booking_copy: "",
-        equipment_type: "",
-        booking_for: "",
-      },
-    ])
+    const newDetail = {
+      original_planned_vessel: "",
+      e_t_d_of_original_planned_vessel: "",
+      change_in_original_vessel: false,
+      revised_vessel: "",
+      etd_of_revised_vessel: "",
+      empty_pickup_validity_from: "",
+      empty_pickup_validity_till: "",
+      estimate_gate_opening_date: "",
+      estimated_gate_cutoff_date: "",
+      s_i_cut_off_date: "",
+      booking_received_from_carrier_on: "",
+      additional_remarks: "",
+      line_booking_copy: "",
+      equipment_type: "",
+      booking_for: "",
+    }
+
+    if (isAssignment) {
+      setRequestedBookingDetails([...requestedBookingDetails, newDetail])
+    } else {
+      setLinerBookingDetails([...linerBookingDetails, newDetail])
+    }
   }
 
   function generateEquipmentCodeForBooking(equipmentType: string) {
@@ -402,13 +451,15 @@ export function LinerBookingForm({
   }
 
   const bulkAddLinerBookingDetails = () => {
-    if (mode !== "new") return
+    if (mode !== "new" && !isAssignment) return
     const qty = Number.parseInt((bulkQuantity || "").trim(), 10)
     if (!bulkEquipmentType || !Number.isFinite(qty) || qty < 1) return
 
     const code = generateEquipmentCodeForBooking(bulkEquipmentType)
+
+    const currentDetails = isAssignment ? requestedBookingDetails : linerBookingDetails
     // Avoid duplicates if user bulk-adds same type multiple times
-    const existingCount = (linerBookingDetails || []).filter(
+    const existingCount = (currentDetails || []).filter(
       (d: any) => typeof d?.temporary_booking_number === "string" && d.temporary_booking_number.startsWith(`${code}-`),
     ).length
 
@@ -416,7 +467,6 @@ export function LinerBookingForm({
       const seq = String(existingCount + i + 1).padStart(3, "0")
       return {
         temporary_booking_number: `${code}-${seq}`,
-        // removed suffix and liner booking number for bulk creation
         liner_booking_number: "",
         mbl_number: bulkMblNumber || "",
         carrier: bulkCarrier || "",
@@ -439,23 +489,43 @@ export function LinerBookingForm({
       }
     })
 
-    setLinerBookingDetails((prev: any[]) => [...prev, ...newItems])
+    if (isAssignment) {
+      setRequestedBookingDetails((prev: any[]) => [...prev, ...newItems])
+    } else {
+      setLinerBookingDetails((prev: any[]) => [...prev, ...newItems])
+    }
   }
 
   const removeLinerBookingDetail = (index: number) => {
-    if (linerBookingDetails.length > 1) {
-      setLinerBookingDetails(linerBookingDetails.filter((_: any, i: number) => i !== index))
+    if (isAssignment) {
+      if (requestedBookingDetails.length > 1) {
+        setRequestedBookingDetails(requestedBookingDetails.filter((_: any, i: number) => i !== index))
+      }
+    } else {
+      if (linerBookingDetails.length > 1) {
+        setLinerBookingDetails(linerBookingDetails.filter((_: any, i: number) => i !== index))
+      }
     }
   }
 
   const updateLinerBookingDetail = (index: number, field: string, value: any) => {
-    const updated = [...linerBookingDetails]
-    updated[index] = { ...updated[index], [field]: value }
-    // Mirror behavior: in "new" mode keep booking_for in sync with selected equipment
-    if (mode === "new" && field === "equipment_type") {
-      updated[index].booking_for = value || ""
+    if (isAssignment) {
+      const updated = [...requestedBookingDetails]
+      updated[index] = { ...updated[index], [field]: value }
+      // Mirror behavior: in assignment mode keep booking_for in sync with selected equipment
+      if (field === "equipment_type") {
+        updated[index].booking_for = value || ""
+      }
+      setRequestedBookingDetails(updated)
+    } else {
+      const updated = [...linerBookingDetails]
+      updated[index] = { ...updated[index], [field]: value }
+      // Mirror behavior: in "new" mode keep booking_for in sync with selected equipment
+      if (mode === "new" && field === "equipment_type") {
+        updated[index].booking_for = value || ""
+      }
+      setLinerBookingDetails(updated)
     }
-    setLinerBookingDetails(updated)
   }
 
   const handleUnmappingChange = (checked: boolean) => {
@@ -991,23 +1061,9 @@ export function LinerBookingForm({
 
                         {/* Equipment Validation Display - Only for Edit Mode with Shipment Plan */}
                         {mode === "edit" && linerBooking?.shipmentPlan && getShipmentPlanEquipment().length > 0 && (
-                          <div
-                            className={`border rounded-lg p-4 ${
-                              equipmentValidation.isValid
-                                ? "bg-green-50 border-green-200"
-                                : "bg-yellow-50 border-yellow-200"
-                            }`}
-                          >
-                            <h4 className="text-sm font-semibold text-gray-700 mb-2">Equipment Allocation Status</h4>
-                            <p
-                              className={`text-sm ${
-                                equipmentValidation.isValid ? "text-green-700" : "text-yellow-700"
-                              }`}
-                            >
-                              {equipmentValidation.message}
-                            </p>
-
-                            {/* Equipment Summary */}
+                          <div className="mt-6 p-4 bg-gray-50 rounded-lg">
+                            <h4 className="text-sm font-medium text-gray-900 mb-2">Equipment Allocation Status</h4>
+                            <div className="text-xs text-gray-600 mb-2">{equipmentValidation.message}</div>
                             <div className="mt-3 grid grid-cols-2 gap-4">
                               <div>
                                 <h5 className="text-xs font-medium text-gray-600 mb-1">Required Equipment:</h5>
@@ -1155,6 +1211,9 @@ export function LinerBookingForm({
                                       <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">
                                         Created
                                       </th>
+                                      <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">
+                                        Actions
+                                      </th>
                                     </tr>
                                   </thead>
                                   <tbody className="divide-y divide-gray-100 bg-white">
@@ -1165,21 +1224,68 @@ export function LinerBookingForm({
                                       const temp = d?.temporary_booking_number || "N/A"
                                       const eqp = d?.equipment_type || "N/A"
                                       const st = b?.data?.carrier_booking_status || "N/A"
+                                      const isLinked = b.shipmentPlanId === linerBooking?.shipmentPlan?.id
+                                      const canUnlink =
+                                        isLinked && linerBooking?.data?.carrier_booking_status !== "Booked"
+
                                       return (
-                                        <tr key={b.id} className="hover:bg-gray-50">
+                                        <tr key={b.id} className={`hover:bg-gray-50 ${isLinked ? "bg-blue-50" : ""}`}>
                                           <td className="px-3 py-2">
                                             <input
                                               type="checkbox"
                                               name="selectedAvailableIds"
                                               value={b.id}
                                               className="h-4 w-4"
+                                              disabled={isLinked}
                                             />
                                           </td>
-                                          <td className="px-3 py-2 text-sm text-gray-800">{temp}</td>
+                                          <td className="px-3 py-2 text-sm text-gray-800">
+                                            <div className="flex items-center gap-2">
+                                              {temp}
+                                              {isLinked && (
+                                                <span className="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-blue-100 text-blue-800">
+                                                  Linked
+                                                </span>
+                                              )}
+                                            </div>
+                                          </td>
                                           <td className="px-3 py-2 text-sm text-gray-700">{eqp}</td>
                                           <td className="px-3 py-2 text-sm text-gray-700">{st || "N/A"}</td>
                                           <td className="px-3 py-2 text-sm text-gray-600">
                                             {b.createdAt ? new Date(b.createdAt).toLocaleDateString() : "N/A"}
+                                          </td>
+                                          <td className="px-3 py-2">
+                                            {canUnlink && (
+                                              <Button
+                                                type="submit"
+                                                name="_action"
+                                                value="unlink_booking"
+                                                className="bg-red-600 hover:bg-red-700 text-white text-xs px-2 py-1"
+                                                onClick={(e) => {
+                                                  console.log("[v0] Unlink button clicked for booking:", b.id)
+                                                  console.log(
+                                                    "[v0] Current linerBookingDetails length:",
+                                                    linerBookingDetails.length,
+                                                  )
+
+                                                  const form = e.currentTarget.form
+                                                  if (form) {
+                                                    const existingInputs =
+                                                      form.querySelectorAll('input[name="bookingId"]')
+                                                    existingInputs.forEach((input) => input.remove())
+
+                                                    const input = document.createElement("input")
+                                                    input.type = "hidden"
+                                                    input.name = "bookingId"
+                                                    input.value = b.id
+                                                    form.appendChild(input)
+                                                    console.log("[v0] Added hidden input with bookingId:", b.id)
+                                                  }
+                                                }}
+                                              >
+                                                Unlink
+                                              </Button>
+                                            )}
                                           </td>
                                         </tr>
                                       )
@@ -1202,8 +1308,9 @@ export function LinerBookingForm({
                             </div>
 
                             <div className="mt-3 rounded-md bg-green-50 border border-green-200 p-3 text-xs text-green-800">
-                              Tip: Linked bookings will be marked as “Booked” and attached to this shipment plan, and
-                              will no longer appear in the Available Liner Bookings list.
+                              Tip: Linked bookings will be attached to this shipment plan and show with a "Linked"
+                              badge. You can unlink them before clicking "All Booking Assigned". Once booked, unlinking
+                              is not allowed.
                             </div>
                           </div>
                         ) : (
@@ -1307,78 +1414,166 @@ export function LinerBookingForm({
                             )}
 
                             {/* Existing details list/cards */}
-                            {linerBookingDetails.map((detail: any, index: number) => (
-                              <div key={index} className="bg-white border border-gray-200 rounded-lg p-6 mb-4 relative">
-                                <div className="flex justify-between items-center mb-4">
-                                  <h5 className="text-sm font-semibold text-gray-700">Booking Detail #{index + 1}</h5>
-                                  {linerBookingDetails.length > 1 && (
-                                    <Button
-                                      type="button"
-                                      onClick={() => removeLinerBookingDetail(index)}
-                                      className="bg-red-500 hover:bg-red-600 text-white px-2 py-1 rounded text-xs font-medium transition-all duration-200"
-                                    >
-                                      Remove
-                                    </Button>
-                                  )}
-                                </div>
-
-                                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                                  {/* Equipment Selection - Only show if linked to shipment plan in edit mode */}
-                                  {mode === "edit" &&
-                                    linerBooking?.shipmentPlan &&
-                                    getShipmentPlanEquipment().length > 0 && (
-                                      <>
-                                        <div className="space-y-2">
-                                          <Label className="text-xs font-medium text-gray-600">
-                                            Equipment Type <span className="text-red-500">*</span>
-                                          </Label>
-                                          <Select
-                                            name={`liner_booking_details[${index}][equipment_type]`}
-                                            value={detail.equipment_type || ""}
-                                            onChange={(e) =>
-                                              updateLinerBookingDetail(index, "equipment_type", e.target.value)
+                            {(isAssignment ? requestedBookingDetails : linerBookingDetails).map(
+                              (detail: any, index: number) => (
+                                <div
+                                  key={index}
+                                  className="bg-white border border-gray-200 rounded-lg p-6 mb-4 relative"
+                                >
+                                  <div className="flex justify-between items-center mb-4">
+                                    <h5 className="text-sm font-semibold text-gray-700">Booking Detail #{index + 1}</h5>
+                                    <div className="flex gap-2">
+                                      {isAssignment && mode === "edit" && linerBooking?.shipmentPlan && (
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            // Handle unlinking individual booking detail
+                                            console.log("[v0] Unlink booking detail", index)
+                                            // This would remove the detail from the assignment but keep it in the form
+                                            if (requestedBookingDetails.length > 1) {
+                                              setRequestedBookingDetails(
+                                                requestedBookingDetails.filter((_: any, i: number) => i !== index),
+                                              )
                                             }
-                                            className="text-sm"
-                                          >
-                                            <option value="">-- Select Equipment --</option>
-                                            {getAvailableEquipmentForBookingDetail(index).map(
-                                              (equipment: any, eqIndex: number) => (
-                                                <option
-                                                  key={eqIndex}
-                                                  value={`${equipment.equipment_type}|${equipment.trackingNumber}`}
-                                                >
-                                                  {equipment.equipment_type} ({equipment.trackingNumber})
-                                                </option>
-                                              ),
-                                            )}
-                                          </Select>
-                                        </div>
+                                          }}
+                                          className="px-3 py-1 bg-gray-500 text-white text-xs font-medium rounded hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-gray-500 focus:ring-offset-2"
+                                        >
+                                          Unlink
+                                        </button>
+                                      )}
+                                      {isAssignment && mode === "edit" && linerBooking?.shipmentPlan && (
+                                        <button
+                                          type="submit"
+                                          name="_action"
+                                          value="allocate_individual"
+                                          onClick={(e) => {
+                                            // Add hidden input for booking detail index
+                                            const form = e.currentTarget.form
+                                            if (form) {
+                                              // Remove any existing detailIndex inputs
+                                              const existingInputs = form.querySelectorAll('input[name="detailIndex"]')
+                                              existingInputs.forEach((input) => input.remove())
 
-                                        <div className="space-y-2">
-                                          <Label className="text-xs font-medium text-gray-600">Booking For</Label>
-                                          <div className="p-2 bg-gray-50 border border-gray-200 rounded text-xs text-gray-700">
-                                            {detail.equipment_type
-                                              ? (() => {
-                                                  const [equipmentType, trackingNumber] =
-                                                    detail.equipment_type.split("|")
-                                                  return `${equipmentType} - ${trackingNumber}`
-                                                })()
-                                              : "Select equipment"}
+                                              // Add new hidden input
+                                              const hiddenInput = document.createElement("input")
+                                              hiddenInput.type = "hidden"
+                                              hiddenInput.name = "detailIndex"
+                                              hiddenInput.value = index.toString()
+                                              form.appendChild(hiddenInput)
+                                            }
+                                          }}
+                                          className="px-3 py-1 bg-blue-600 text-white text-xs font-medium rounded hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2"
+                                        >
+                                          Allocate
+                                        </button>
+                                      )}
+                                      <Button
+                                        type="button"
+                                        onClick={() => removeLinerBookingDetail(index)}
+                                        className="bg-red-500 hover:bg-red-600 text-white px-3 py-1 rounded text-xs font-medium transition-all duration-200"
+                                      >
+                                        Remove
+                                      </Button>
+                                    </div>
+                                  </div>
+
+                                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                                    {/* Equipment Selection - Only show if linked to shipment plan in edit mode */}
+                                    {mode === "edit" &&
+                                      linerBooking?.shipmentPlan &&
+                                      getShipmentPlanEquipment().length > 0 && (
+                                        <>
+                                          <div>
+                                            <label
+                                              htmlFor={`liner_booking_details[${index}][equipment_type]`}
+                                              className="block text-sm font-medium text-gray-700"
+                                            >
+                                              Equipment Type *
+                                            </label>
+                                            <Select
+                                              id={`liner_booking_details[${index}][equipment_type]`}
+                                              name={`liner_booking_details[${index}][equipment_type]`}
+                                              value={detail.equipment_type || ""}
+                                              onChange={(e) =>
+                                                updateLinerBookingDetail(index, "equipment_type", e.target.value)
+                                              }
+                                              className="text-sm"
+                                            >
+                                              <option value="">-- Select Equipment --</option>
+                                              {getUnallocatedEquipmentTypes().map(
+                                                (equipmentType: string, eqIndex: number) => (
+                                                  <option key={`${equipmentType}-${eqIndex}`} value={equipmentType}>
+                                                    {equipmentType}
+                                                  </option>
+                                                ),
+                                              )}
+                                            </Select>
                                           </div>
-                                          <input
-                                            type="hidden"
-                                            name={`liner_booking_details[${index}][booking_for]`}
-                                            value={
-                                              detail.booking_for ||
-                                              (detail.equipment_type ? detail.equipment_type.split("|")[0] : "")
-                                            }
-                                          />
-                                        </div>
-                                      </>
-                                    )}
 
-                                  {mode === "edit" &&
-                                    (!linerBooking?.shipmentPlan || getShipmentPlanEquipment().length === 0) && (
+                                          <div className="space-y-2">
+                                            <Label className="text-xs font-medium text-gray-600">Booking For</Label>
+                                            <div className="p-2 bg-gray-50 border border-gray-200 rounded text-xs text-gray-700">
+                                              {detail.equipment_type
+                                                ? (() => {
+                                                    const [equipmentType, trackingNumber] =
+                                                      detail.equipment_type.split("|")
+                                                    return `${equipmentType} - ${trackingNumber}`
+                                                  })()
+                                                : "Select equipment"}
+                                            </div>
+                                            <input
+                                              type="hidden"
+                                              name={`liner_booking_details[${index}][booking_for]`}
+                                              value={
+                                                detail.booking_for ||
+                                                (detail.equipment_type ? detail.equipment_type.split("|")[0] : "")
+                                              }
+                                            />
+                                          </div>
+                                        </>
+                                      )}
+
+                                    {mode === "edit" &&
+                                      (!linerBooking?.shipmentPlan || getShipmentPlanEquipment().length === 0) && (
+                                        <>
+                                          <div className="space-y-2">
+                                            <Label className="text-xs font-medium text-gray-600">
+                                              Equipment Type <span className="text-red-500">*</span>
+                                            </Label>
+                                            <Select
+                                              name={`liner_booking_details[${index}][equipment_type]`}
+                                              value={detail.equipment_type || ""}
+                                              onChange={(e) =>
+                                                updateLinerBookingDetail(index, "equipment_type", e.target.value)
+                                              }
+                                              className="text-sm"
+                                            >
+                                              <option value="">-- Select Equipment Type --</option>
+                                              {(dataPoints?.equipment || []).map((eq: any) => (
+                                                <option key={eq.id} value={eq.name}>
+                                                  {eq.name}
+                                                </option>
+                                              ))}
+                                            </Select>
+                                          </div>
+
+                                          <div className="space-y-2">
+                                            <Label className="text-xs font-medium text-gray-600">Booking For</Label>
+                                            <div className="p-2 bg-gray-50 border border-gray-200 rounded text-xs text-gray-700">
+                                              {detail.equipment_type || "Select equipment type"}
+                                            </div>
+                                            <input
+                                              type="hidden"
+                                              name={`liner_booking_details[${index}][booking_for]`}
+                                              value={detail.booking_for || detail.equipment_type || ""}
+                                            />
+                                          </div>
+                                        </>
+                                      )}
+
+                                    {/* In "new" mode, show Equipment Type dropdown (from dataPoints.equipment)
+                                      and a free-text "Booking For" field */}
+                                    {mode === "new" && (
                                       <>
                                         <div className="space-y-2">
                                           <Label className="text-xs font-medium text-gray-600">
@@ -1415,170 +1610,101 @@ export function LinerBookingForm({
                                       </>
                                     )}
 
-                                  {/* In "new" mode, show Equipment Type dropdown (from dataPoints.equipment)
-                                      and a free-text "Booking For" field */}
-                                  {mode === "new" && (
-                                    <>
-                                      <div className="space-y-2">
-                                        <Label className="text-xs font-medium text-gray-600">
-                                          Equipment Type <span className="text-red-500">*</span>
-                                        </Label>
-                                        <Select
-                                          name={`liner_booking_details[${index}][equipment_type]`}
-                                          value={detail.equipment_type || ""}
-                                          onChange={(e) =>
-                                            updateLinerBookingDetail(index, "equipment_type", e.target.value)
-                                          }
-                                          className="text-sm"
-                                        >
-                                          <option value="">-- Select Equipment Type --</option>
-                                          {(dataPoints?.equipment || []).map((eq: any) => (
-                                            <option key={eq.id} value={eq.name}>
-                                              {eq.name}
-                                            </option>
-                                          ))}
-                                        </Select>
-                                      </div>
-
-                                      <div className="space-y-2">
-                                        <Label className="text-xs font-medium text-gray-600">Booking For</Label>
-                                        <div className="p-2 bg-gray-50 border border-gray-200 rounded text-xs text-gray-700">
-                                          {detail.equipment_type || "Select equipment type"}
-                                        </div>
-                                        <input
-                                          type="hidden"
-                                          name={`liner_booking_details[${index}][booking_for]`}
-                                          value={detail.booking_for || detail.equipment_type || ""}
-                                        />
-                                      </div>
-                                    </>
-                                  )}
-
-                                  {/* keep rest of the fields */}
-                                  <div className="space-y-2">
-                                    <Label className="text-xs font-medium text-gray-600">
-                                      Temporary Booking Number
-                                    </Label>
-                                    <Input
-                                      name={`liner_booking_details[${index}][temporary_booking_number]`}
-                                      value={detail.temporary_booking_number}
-                                      onChange={(e) =>
-                                        updateLinerBookingDetail(index, "temporary_booking_number", e.target.value)
-                                      }
-                                      placeholder="Enter temp booking number"
-                                      className="text-sm"
-                                    />
-                                  </div>
-
-                                  <div className="space-y-2">
-                                    <Label className="text-xs font-medium text-gray-600">
-                                      Suffix for Anticipatory Temp Booking Number
-                                    </Label>
-                                    <Input
-                                      name={`liner_booking_details[${index}][suffix_for_anticipatory_temporary_booking_number]`}
-                                      value={detail.suffix_for_anticipatory_temporary_booking_number}
-                                      onChange={(e) =>
-                                        updateLinerBookingDetail(
-                                          index,
-                                          "suffix_for_anticipatory_temporary_booking_number",
-                                          e.target.value,
-                                        )
-                                      }
-                                      placeholder="Enter suffix"
-                                      className="text-sm"
-                                    />
-                                  </div>
-
-                                  <div className="space-y-2">
-                                    <Label className="text-xs font-medium text-gray-600">Liner Booking Number</Label>
-                                    <Input
-                                      name={`liner_booking_details[${index}][liner_booking_number]`}
-                                      value={detail.liner_booking_number}
-                                      onChange={(e) =>
-                                        updateLinerBookingDetail(index, "liner_booking_number", e.target.value)
-                                      }
-                                      placeholder="Enter liner booking number"
-                                      className="text-sm"
-                                    />
-                                  </div>
-
-                                  <div className="space-y-2">
-                                    <Label className="text-xs font-medium text-gray-600">MBL Number</Label>
-                                    <Input
-                                      name={`liner_booking_details[${index}][mbl_number]`}
-                                      value={detail.mbl_number}
-                                      onChange={(e) => updateLinerBookingDetail(index, "mbl_number", e.target.value)}
-                                      placeholder="Enter MBL number"
-                                      className="text-sm"
-                                    />
-                                  </div>
-
-                                  <div className="space-y-2">
-                                    <Label className="text-xs font-medium text-gray-600">Carrier</Label>
-                                    <SearchableSelect
-                                      name={`liner_booking_details[${index}][carrier]`}
-                                      value={detail.carrier}
-                                      onChange={(value) => updateLinerBookingDetail(index, "carrier", value)}
-                                      placeholder="Search carriers..."
-                                      className="text-sm"
-                                      options={dataPoints.carriers.map((carrier) => ({
-                                        value: carrier.name,
-                                        label: carrier.name,
-                                      }))}
-                                    />
-                                  </div>
-
-                                  <div className="space-y-2">
-                                    <Label className="text-xs font-medium text-gray-600">Contract</Label>
-                                    <Input
-                                      name={`liner_booking_details[${index}][contract]`}
-                                      value={detail.contract}
-                                      onChange={(e) => updateLinerBookingDetail(index, "contract", e.target.value)}
-                                      placeholder="Enter contract"
-                                      className="text-sm"
-                                    />
-                                  </div>
-
-                                  <div className="space-y-2">
-                                    <Label className="text-xs font-medium text-gray-600">Original Planned Vessel</Label>
-                                    <SearchableSelect
-                                      name={`liner_booking_details[${index}][original_planned_vessel]`}
-                                      value={detail.original_planned_vessel}
-                                      onChange={(value) =>
-                                        updateLinerBookingDetail(index, "original_planned_vessel", value)
-                                      }
-                                      placeholder="Search vessels..."
-                                      className="text-sm"
-                                      options={dataPoints.vessels.map((vessel) => ({
-                                        value: vessel.name,
-                                        label: vessel.name,
-                                      }))}
-                                    />
-                                  </div>
-
-                                  <div className="space-y-2">
-                                    <Label className="text-xs font-medium text-gray-600">
-                                      <Checkbox
-                                        name={`liner_booking_details[${index}][change_in_original_vessel]`}
-                                        checked={detail.change_in_original_vessel}
-                                        onChange={(checked) =>
-                                          updateLinerBookingDetail(index, "change_in_original_vessel", checked)
-                                        }
-                                        className="mr-2"
-                                      />
-                                      Change in Original Vessel
-                                    </Label>
-                                  </div>
-                                </div>
-
-                                {detail.change_in_original_vessel && (
-                                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
+                                    {/* keep rest of the fields */}
                                     <div className="space-y-2">
-                                      <Label className="text-xs font-medium text-gray-600">Revised Vessel</Label>
+                                      <Label className="text-xs font-medium text-gray-600">
+                                        Temporary Booking Number
+                                      </Label>
+                                      <Input
+                                        name={`liner_booking_details[${index}][temporary_booking_number]`}
+                                        value={detail.temporary_booking_number}
+                                        onChange={(e) =>
+                                          updateLinerBookingDetail(index, "temporary_booking_number", e.target.value)
+                                        }
+                                        placeholder="Enter temp booking number"
+                                        className="text-sm"
+                                      />
+                                    </div>
+
+                                    <div className="space-y-2">
+                                      <Label className="text-xs font-medium text-gray-600">
+                                        Suffix for Anticipatory Temp Booking Number
+                                      </Label>
+                                      <Input
+                                        name={`liner_booking_details[${index}][suffix_for_anticipatory_temporary_booking_number]`}
+                                        value={detail.suffix_for_anticipatory_temporary_booking_number}
+                                        onChange={(e) =>
+                                          updateLinerBookingDetail(
+                                            index,
+                                            "suffix_for_anticipatory_temporary_booking_number",
+                                            e.target.value,
+                                          )
+                                        }
+                                        placeholder="Enter suffix"
+                                        className="text-sm"
+                                      />
+                                    </div>
+
+                                    <div className="space-y-2">
+                                      <Label className="text-xs font-medium text-gray-600">Liner Booking Number</Label>
+                                      <Input
+                                        name={`liner_booking_details[${index}][liner_booking_number]`}
+                                        value={detail.liner_booking_number}
+                                        onChange={(e) =>
+                                          updateLinerBookingDetail(index, "liner_booking_number", e.target.value)
+                                        }
+                                        placeholder="Enter liner booking number"
+                                        className="text-sm"
+                                      />
+                                    </div>
+
+                                    <div className="space-y-2">
+                                      <Label className="text-xs font-medium text-gray-600">MBL Number</Label>
+                                      <Input
+                                        name={`liner_booking_details[${index}][mbl_number]`}
+                                        value={detail.mbl_number}
+                                        onChange={(e) => updateLinerBookingDetail(index, "mbl_number", e.target.value)}
+                                        placeholder="Enter MBL number"
+                                        className="text-sm"
+                                      />
+                                    </div>
+
+                                    <div className="space-y-2">
+                                      <Label className="text-xs font-medium text-gray-600">Carrier</Label>
                                       <SearchableSelect
-                                        name={`liner_booking_details[${index}][revised_vessel]`}
-                                        value={detail.revised_vessel}
-                                        onChange={(value) => updateLinerBookingDetail(index, "revised_vessel", value)}
+                                        name={`liner_booking_details[${index}][carrier]`}
+                                        value={detail.carrier}
+                                        onChange={(value) => updateLinerBookingDetail(index, "carrier", value)}
+                                        placeholder="Search carriers..."
+                                        className="text-sm"
+                                        options={dataPoints.carriers.map((carrier) => ({
+                                          value: carrier.name,
+                                          label: carrier.name,
+                                        }))}
+                                      />
+                                    </div>
+
+                                    <div className="space-y-2">
+                                      <Label className="text-xs font-medium text-gray-600">Contract</Label>
+                                      <Input
+                                        name={`liner_booking_details[${index}][contract]`}
+                                        value={detail.contract}
+                                        onChange={(e) => updateLinerBookingDetail(index, "contract", e.target.value)}
+                                        placeholder="Enter contract"
+                                        className="text-sm"
+                                      />
+                                    </div>
+
+                                    <div className="space-y-2">
+                                      <Label className="text-xs font-medium text-gray-600">
+                                        Original Planned Vessel
+                                      </Label>
+                                      <SearchableSelect
+                                        name={`liner_booking_details[${index}][original_planned_vessel]`}
+                                        value={detail.original_planned_vessel}
+                                        onChange={(value) =>
+                                          updateLinerBookingDetail(index, "original_planned_vessel", value)
+                                        }
                                         placeholder="Search vessels..."
                                         className="text-sm"
                                         options={dataPoints.vessels.map((vessel) => ({
@@ -1589,198 +1715,248 @@ export function LinerBookingForm({
                                     </div>
 
                                     <div className="space-y-2">
-                                      <Label className="text-xs font-medium text-gray-600">ETD of Revised Vessel</Label>
+                                      <Label className="text-xs font-medium text-gray-600">
+                                        <Checkbox
+                                          name={`liner_booking_details[${index}][change_in_original_vessel]`}
+                                          checked={detail.change_in_original_vessel}
+                                          onChange={(checked) =>
+                                            updateLinerBookingDetail(index, "change_in_original_vessel", checked)
+                                          }
+                                          className="mr-2"
+                                        />
+                                        Change in Original Vessel
+                                      </Label>
+                                    </div>
+                                  </div>
+
+                                  {detail.change_in_original_vessel && (
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
+                                      <div className="space-y-2">
+                                        <Label className="text-xs font-medium text-gray-600">Revised Vessel</Label>
+                                        <SearchableSelect
+                                          name={`liner_booking_details[${index}][revised_vessel]`}
+                                          value={detail.revised_vessel}
+                                          onChange={(value) => updateLinerBookingDetail(index, "revised_vessel", value)}
+                                          placeholder="Search vessels..."
+                                          className="text-sm"
+                                          options={dataPoints.vessels.map((vessel) => ({
+                                            value: vessel.name,
+                                            label: vessel.name,
+                                          }))}
+                                        />
+                                      </div>
+
+                                      <div className="space-y-2">
+                                        <Label className="text-xs font-medium text-gray-600">
+                                          ETD of Revised Vessel
+                                        </Label>
+                                        <Input
+                                          type="date"
+                                          name={`liner_booking_details[${index}][etd_of_revised_vessel]`}
+                                          value={formatDateForInput(detail.etd_of_revised_vessel)}
+                                          onChange={(e) =>
+                                            updateLinerBookingDetail(index, "etd_of_revised_vessel", e.target.value)
+                                          }
+                                          className="text-sm"
+                                        />
+                                      </div>
+                                    </div>
+                                  )}
+
+                                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 mt-4">
+                                    <div className="space-y-2">
+                                      <Label className="text-xs font-medium text-gray-600">
+                                        ETD of Original Planned Vessel
+                                      </Label>
                                       <Input
                                         type="date"
-                                        name={`liner_booking_details[${index}][etd_of_revised_vessel]`}
-                                        value={formatDateForInput(detail.etd_of_revised_vessel)}
+                                        name={`liner_booking_details[${index}][e_t_d_of_original_planned_vessel]`}
+                                        value={formatDateForInput(detail.e_t_d_of_original_planned_vessel)}
                                         onChange={(e) =>
-                                          updateLinerBookingDetail(index, "etd_of_revised_vessel", e.target.value)
+                                          updateLinerBookingDetail(
+                                            index,
+                                            "e_t_d_of_original_planned_vessel",
+                                            e.target.value,
+                                          )
+                                        }
+                                        className="text-sm"
+                                      />
+                                    </div>
+
+                                    <div className="space-y-2">
+                                      <Label className="text-xs font-medium text-gray-600">
+                                        Empty Pickup Validity From
+                                      </Label>
+                                      <Input
+                                        type="date"
+                                        name={`liner_booking_details[${index}][empty_pickup_validity_from]`}
+                                        value={formatDateForInput(detail.empty_pickup_validity_from)}
+                                        onChange={(e) =>
+                                          updateLinerBookingDetail(index, "empty_pickup_validity_from", e.target.value)
+                                        }
+                                        className="text-sm"
+                                      />
+                                    </div>
+
+                                    <div className="space-y-2">
+                                      <Label className="text-xs font-medium text-gray-600">
+                                        Empty Pickup Validity Till
+                                      </Label>
+                                      <Input
+                                        type="date"
+                                        name={`liner_booking_details[${index}][empty_pickup_validity_till]`}
+                                        value={formatDateForInput(detail.empty_pickup_validity_till)}
+                                        onChange={(e) =>
+                                          updateLinerBookingDetail(index, "empty_pickup_validity_till", e.target.value)
+                                        }
+                                        className="text-sm"
+                                      />
+                                    </div>
+
+                                    <div className="space-y-2">
+                                      <Label className="text-xs font-medium text-gray-600">Gate Opening Date</Label>
+                                      <Input
+                                        type="date"
+                                        name={`liner_booking_details[${index}][estimate_gate_opening_date]`}
+                                        value={formatDateForInput(detail.estimate_gate_opening_date)}
+                                        onChange={(e) =>
+                                          updateLinerBookingDetail(index, "estimate_gate_opening_date", e.target.value)
+                                        }
+                                        className="text-sm"
+                                      />
+                                    </div>
+
+                                    <div className="space-y-2">
+                                      <Label className="text-xs font-medium text-gray-600">Gate Cutoff Date</Label>
+                                      <Input
+                                        type="date"
+                                        name={`liner_booking_details[${index}][estimated_gate_cutoff_date]`}
+                                        value={formatDateForInput(detail.estimated_gate_cutoff_date)}
+                                        onChange={(e) =>
+                                          updateLinerBookingDetail(index, "estimated_gate_cutoff_date", e.target.value)
+                                        }
+                                        className="text-sm"
+                                      />
+                                    </div>
+
+                                    <div className="space-y-2">
+                                      <Label className="text-xs font-medium text-gray-600">SI Cut Off Date</Label>
+                                      <Input
+                                        type="date"
+                                        name={`liner_booking_details[${index}][s_i_cut_off_date]`}
+                                        value={formatDateForInput(detail.s_i_cut_off_date)}
+                                        onChange={(e) =>
+                                          updateLinerBookingDetail(index, "s_i_cut_off_date", e.target.value)
                                         }
                                         className="text-sm"
                                       />
                                     </div>
                                   </div>
-                                )}
 
-                                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 mt-4">
-                                  <div className="space-y-2">
-                                    <Label className="text-xs font-medium text-gray-600">
-                                      ETD of Original Planned Vessel
-                                    </Label>
-                                    <Input
-                                      type="date"
-                                      name={`liner_booking_details[${index}][e_t_d_of_original_planned_vessel]`}
-                                      value={formatDateForInput(detail.e_t_d_of_original_planned_vessel)}
-                                      onChange={(e) =>
-                                        updateLinerBookingDetail(
-                                          index,
-                                          "e_t_d_of_original_planned_vessel",
-                                          e.target.value,
-                                        )
-                                      }
-                                      className="text-sm"
-                                    />
-                                  </div>
+                                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-4">
+                                    <div className="space-y-2">
+                                      <Label className="text-xs font-medium text-gray-600">
+                                        Booking Received From Carrier On
+                                      </Label>
+                                      <Input
+                                        type="date"
+                                        name={`liner_booking_details[${index}][booking_received_from_carrier_on]`}
+                                        value={formatDateForInput(detail.booking_received_from_carrier_on)}
+                                        onChange={(e) =>
+                                          updateLinerBookingDetail(
+                                            index,
+                                            "booking_received_from_carrier_on",
+                                            e.target.value,
+                                          )
+                                        }
+                                        className="text-sm"
+                                      />
+                                    </div>
 
-                                  <div className="space-y-2">
-                                    <Label className="text-xs font-medium text-gray-600">
-                                      Empty Pickup Validity From
-                                    </Label>
-                                    <Input
-                                      type="date"
-                                      name={`liner_booking_details[${index}][empty_pickup_validity_from]`}
-                                      value={formatDateForInput(detail.empty_pickup_validity_from)}
-                                      onChange={(e) =>
-                                        updateLinerBookingDetail(index, "empty_pickup_validity_from", e.target.value)
-                                      }
-                                      className="text-sm"
-                                    />
-                                  </div>
+                                    <div className="space-y-2">
+                                      <Label className="text-xs font-medium text-gray-600">
+                                        Line Booking Copy (URL)
+                                      </Label>
+                                      <Input
+                                        type="url"
+                                        name={`liner_booking_details[${index}][line_booking_copy]`}
+                                        value={detail.line_booking_copy}
+                                        onChange={(e) =>
+                                          updateLinerBookingDetail(index, "line_booking_copy", e.target.value)
+                                        }
+                                        placeholder="Enter document URL"
+                                        className="text-sm"
+                                      />
+                                    </div>
+                                    <div className="space-y-2">
+                                      <Label className="text-xs font-medium text-gray-600">
+                                        Line Booking Copy (PDF File)
+                                      </Label>
+                                      <Input
+                                        type="file"
+                                        name={`liner_booking_details[${index}][line_booking_copy_file]`}
+                                        onChange={(e) =>
+                                          updateLinerBookingDetail(
+                                            index,
+                                            "line_booking_copy_file",
+                                            e.target.files ? e.target.files[0] : null,
+                                          )
+                                        }
+                                        accept=".pdf"
+                                        className="text-sm"
+                                      />
+                                      {detail.line_booking_copy_file &&
+                                        typeof detail.line_booking_copy_file === "string" && (
+                                          <p className="text-xs text-gray-500 mt-1">
+                                            Current file:{" "}
+                                            <a
+                                              href={detail.line_booking_copy_file}
+                                              target="_blank"
+                                              rel="noopener noreferrer"
+                                              className="text-blue-600 hover:underline"
+                                            >
+                                              View PDF
+                                            </a>
+                                          </p>
+                                        )}
+                                    </div>
 
-                                  <div className="space-y-2">
-                                    <Label className="text-xs font-medium text-gray-600">
-                                      Empty Pickup Validity Till
-                                    </Label>
-                                    <Input
-                                      type="date"
-                                      name={`liner_booking_details[${index}][empty_pickup_validity_till]`}
-                                      value={formatDateForInput(detail.empty_pickup_validity_till)}
-                                      onChange={(e) =>
-                                        updateLinerBookingDetail(index, "empty_pickup_validity_till", e.target.value)
-                                      }
-                                      className="text-sm"
-                                    />
-                                  </div>
-
-                                  <div className="space-y-2">
-                                    <Label className="text-xs font-medium text-gray-600">Gate Opening Date</Label>
-                                    <Input
-                                      type="date"
-                                      name={`liner_booking_details[${index}][estimate_gate_opening_date]`}
-                                      value={formatDateForInput(detail.estimate_gate_opening_date)}
-                                      onChange={(e) =>
-                                        updateLinerBookingDetail(index, "estimate_gate_opening_date", e.target.value)
-                                      }
-                                      className="text-sm"
-                                    />
-                                  </div>
-
-                                  <div className="space-y-2">
-                                    <Label className="text-xs font-medium text-gray-600">Gate Cutoff Date</Label>
-                                    <Input
-                                      type="date"
-                                      name={`liner_booking_details[${index}][estimated_gate_cutoff_date]`}
-                                      value={formatDateForInput(detail.estimated_gate_cutoff_date)}
-                                      onChange={(e) =>
-                                        updateLinerBookingDetail(index, "estimated_gate_cutoff_date", e.target.value)
-                                      }
-                                      className="text-sm"
-                                    />
-                                  </div>
-
-                                  <div className="space-y-2">
-                                    <Label className="text-xs font-medium text-gray-600">SI Cut Off Date</Label>
-                                    <Input
-                                      type="date"
-                                      name={`liner_booking_details[${index}][s_i_cut_off_date]`}
-                                      value={formatDateForInput(detail.s_i_cut_off_date)}
-                                      onChange={(e) =>
-                                        updateLinerBookingDetail(index, "s_i_cut_off_date", e.target.value)
-                                      }
-                                      className="text-sm"
-                                    />
+                                    <div className="space-y-2 md:col-span-3">
+                                      <Label className="text-xs font-medium text-gray-600">Additional Remarks</Label>
+                                      <Textarea
+                                        name={`liner_booking_details[${index}][additional_remarks]`}
+                                        value={detail.additional_remarks}
+                                        onChange={(e) =>
+                                          updateLinerBookingDetail(index, "additional_remarks", e.target.value)
+                                        }
+                                        placeholder="Enter additional remarks"
+                                        className="text-sm"
+                                        rows={2}
+                                      />
+                                    </div>
                                   </div>
                                 </div>
-
-                                <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-4">
-                                  <div className="space-y-2">
-                                    <Label className="text-xs font-medium text-gray-600">
-                                      Booking Received From Carrier On
-                                    </Label>
-                                    <Input
-                                      type="date"
-                                      name={`liner_booking_details[${index}][booking_received_from_carrier_on]`}
-                                      value={formatDateForInput(detail.booking_received_from_carrier_on)}
-                                      onChange={(e) =>
-                                        updateLinerBookingDetail(
-                                          index,
-                                          "booking_received_from_carrier_on",
-                                          e.target.value,
-                                        )
-                                      }
-                                      className="text-sm"
-                                    />
-                                  </div>
-
-                                  <div className="space-y-2">
-                                    <Label className="text-xs font-medium text-gray-600">Line Booking Copy (URL)</Label>
-                                    <Input
-                                      type="url"
-                                      name={`liner_booking_details[${index}][line_booking_copy]`}
-                                      value={detail.line_booking_copy}
-                                      onChange={(e) =>
-                                        updateLinerBookingDetail(index, "line_booking_copy", e.target.value)
-                                      }
-                                      placeholder="Enter document URL"
-                                      className="text-sm"
-                                    />
-                                  </div>
-                                  <div className="space-y-2">
-                                    <Label className="text-xs font-medium text-gray-600">
-                                      Line Booking Copy (PDF File)
-                                    </Label>
-                                    <Input
-                                      type="file"
-                                      name={`liner_booking_details[${index}][line_booking_copy_file]`}
-                                      onChange={(e) =>
-                                        updateLinerBookingDetail(
-                                          index,
-                                          "line_booking_copy_file",
-                                          e.target.files ? e.target.files[0] : null,
-                                        )
-                                      }
-                                      accept=".pdf"
-                                      className="text-sm"
-                                    />
-                                    {detail.line_booking_copy_file &&
-                                      typeof detail.line_booking_copy_file === "string" && (
-                                        <p className="text-xs text-gray-500 mt-1">
-                                          Current file:{" "}
-                                          <a
-                                            href={detail.line_booking_copy_file}
-                                            target="_blank"
-                                            rel="noopener noreferrer"
-                                            className="text-blue-600 hover:underline"
-                                          >
-                                            View PDF
-                                          </a>
-                                        </p>
-                                      )}
-                                  </div>
-
-                                  <div className="space-y-2 md:col-span-3">
-                                    <Label className="text-xs font-medium text-gray-600">Additional Remarks</Label>
-                                    <Textarea
-                                      name={`liner_booking_details[${index}][additional_remarks]`}
-                                      value={detail.additional_remarks}
-                                      onChange={(e) =>
-                                        updateLinerBookingDetail(index, "additional_remarks", e.target.value)
-                                      }
-                                      placeholder="Enter additional remarks"
-                                      className="text-sm"
-                                      rows={2}
-                                    />
-                                  </div>
-                                </div>
-                              </div>
-                            ))}
+                              ),
+                            )}
                           </>
                         )}
                       </div>
                     </div>
                   )}
                 </div>
+
+                {mode === "edit" && linerBooking?.shipmentPlan && requestedBookingDetails.length > 0 && (
+                  <div className="mt-4 flex justify-end">
+                    <button
+                      type="submit"
+                      name="_action"
+                      value="allocate_requested"
+                      className="px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2"
+                    >
+                      Allocate Requested Bookings
+                    </button>
+                  </div>
+                )}
 
                 {/* Form Actions */}
                 <div className="px-6 py-4 bg-gray-50 border-t border-gray-200">
