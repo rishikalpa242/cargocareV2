@@ -291,6 +291,12 @@ export async function action({ request, params }: ActionFunctionArgs) {
     const linerBookingDetails: any[] = []
     let detailIndex = 0
     while (formData.get(`liner_booking_details[${detailIndex}][temporary_booking_number]`) !== null) {
+      // In assignment mode, only include allocated booking details
+      const isAllocated = formData.get(`liner_booking_details[${detailIndex}][allocated]`) === "true"
+      if (assignmentId && !isAllocated) {
+        detailIndex++
+        continue
+      }
       const etdOriginal = formData.get(
         `liner_booking_details[${detailIndex}][e_t_d_of_original_planned_vessel]`,
       ) as string

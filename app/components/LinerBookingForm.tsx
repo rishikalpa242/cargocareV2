@@ -11,7 +11,7 @@ import { Select } from "~/components/ui/select"
 import { SearchableSelect } from "~/components/ui/searchable-select"
 import { Textarea } from "~/components/ui/textarea"
 import { useToast } from "~/components/ui/toast"
-import { useState, useEffect } from "react"
+import { useState, useEffect, useCallback } from "react"
 
 export interface LinerBookingFormProps {
   mode: "new" | "edit"
@@ -74,6 +74,9 @@ export function LinerBookingForm({
     }
     return []
   })
+
+  // Track which booking details have been allocated
+  const [allocatedBookingDetails, setAllocatedBookingDetails] = useState<Set<number>>(new Set())
 
   const [openSections, setOpenSections] = useState(() => {
     if (mode === "edit") {
@@ -158,14 +161,26 @@ export function LinerBookingForm({
   const calculateAllocatedEquipment = () => {
     const allocated = {} as Record<string, number>
 
-    // No need to separately count linked bookings since their details are already merged into linerBookingDetails
-    linerBookingDetails.forEach((detail: any) => {
+    // Count from linked bookings (Link Available tab)
+    linerBookingDetails.forEach((detail: any, index: number) => {
       if (detail.equipment_type) {
         const [equipmentType] = detail.equipment_type.split("|")
         allocated[equipmentType] = (allocated[equipmentType] || 0) + 1
+        console.log("[v0] Allocated from linerBookingDetails:", { index, equipmentType, detail })
       }
     })
 
+    // Count from allocated requested bookings (Request Booking tab)
+    requestedBookingDetails.forEach((detail: any, index: number) => {
+      if (detail.equipment_type && allocatedBookingDetails.has(index)) {
+        // For requested bookings, equipment_type is just the type name (not split by |)
+        const equipmentType = detail.equipment_type
+        allocated[equipmentType] = (allocated[equipmentType] || 0) + 1
+        console.log("[v0] Allocated from requestedBookingDetails:", { index, equipmentType, detail })
+      }
+    })
+
+    console.log("[v0] Final allocated equipment:", allocated)
     return allocated
   }
 
@@ -190,7 +205,7 @@ export function LinerBookingForm({
   }
 
   // Validate equipment allocation
-  const validateEquipmentAllocation = () => {
+  const validateEquipmentAllocation = useCallback(() => {
     if (mode !== "edit" || !linerBooking?.shipmentPlan) {
       setEquipmentValidation({
         isValid: true,
@@ -205,6 +220,15 @@ export function LinerBookingForm({
     const remaining = {} as Record<string, number>
     let isValid = true
     let message = ""
+
+    console.log("[v0] Equipment validation debug:", {
+      required,
+      allocated,
+      linerBookingDetailsCount: linerBookingDetails.length,
+      requestedBookingDetailsCount: requestedBookingDetails.length,
+      allocatedBookingDetailsSize: allocatedBookingDetails.size,
+      allocatedIndices: Array.from(allocatedBookingDetails)
+    })
 
     // Check if we have any equipment requirements
     if (Object.keys(required).length === 0) {
@@ -243,7 +267,7 @@ export function LinerBookingForm({
     }
 
     setEquipmentValidation({ isValid, message, remainingEquipment: remaining })
-  }
+  }, [mode, linerBooking?.shipmentPlan, linerBookingDetails, requestedBookingDetails, allocatedBookingDetails])
 
   // Update state when data changes (after successful form submission)
   useEffect(() => {
@@ -256,7 +280,7 @@ export function LinerBookingForm({
   // Run validation when booking details change
   useEffect(() => {
     validateEquipmentAllocation()
-  }, [linerBookingDetails, mode, linerBooking?.shipmentPlan])
+  }, [linerBookingDetails, requestedBookingDetails, allocatedBookingDetails, mode, linerBooking?.shipmentPlan])
 
   useEffect(() => {
     if (mode !== "edit") return
@@ -1423,12 +1447,17 @@ export function LinerBookingForm({
                                   <div className="flex justify-between items-center mb-4">
                                     <h5 className="text-sm font-semibold text-gray-700">Booking Detail #{index + 1}</h5>
                                     <div className="flex gap-2">
-                                      {isAssignment && mode === "edit" && linerBooking?.shipmentPlan && (
+                                      {/* Unlink button: Only show if this booking detail has been allocated */}
+                                      {isAssignment && mode === "edit" && linerBooking?.shipmentPlan && allocatedBookingDetails.has(index) && (
                                         <button
                                           type="button"
                                           onClick={() => {
                                             // Handle unlinking individual booking detail
                                             console.log("[v0] Unlink booking detail", index)
+                                            // Remove from allocated set
+                                            const newAllocated = new Set(allocatedBookingDetails)
+                                            newAllocated.delete(index)
+                                            setAllocatedBookingDetails(newAllocated)
                                             // This would remove the detail from the assignment but keep it in the form
                                             if (requestedBookingDetails.length > 1) {
                                               setRequestedBookingDetails(
@@ -1441,7 +1470,10 @@ export function LinerBookingForm({
                                           Unlink
                                         </button>
                                       )}
-                                      {isAssignment && mode === "edit" && linerBooking?.shipmentPlan && (
+                                      
+                                      {/* Allocate button: Only show if this booking detail has NOT been allocated and has equipment type */}
+                                      {isAssignment && mode === "edit" && linerBooking?.shipmentPlan && 
+                                       !allocatedBookingDetails.has(index) && detail.equipment_type && (
                                         <button
                                           type="submit"
                                           name="_action"
@@ -1461,15 +1493,29 @@ export function LinerBookingForm({
                                               hiddenInput.value = index.toString()
                                               form.appendChild(hiddenInput)
                                             }
+                                            
+                                            // Mark this booking detail as allocated
+                                            const newAllocated = new Set(allocatedBookingDetails)
+                                            newAllocated.add(index)
+                                            setAllocatedBookingDetails(newAllocated)
                                           }}
                                           className="px-3 py-1 bg-blue-600 text-white text-xs font-medium rounded hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2"
                                         >
                                           Allocate
                                         </button>
                                       )}
+                                      
+                                      {/* Remove button: Always show */}
                                       <Button
                                         type="button"
-                                        onClick={() => removeLinerBookingDetail(index)}
+                                        onClick={() => {
+                                          // Remove from allocated set if it was allocated
+                                          const newAllocated = new Set(allocatedBookingDetails)
+                                          newAllocated.delete(index)
+                                          setAllocatedBookingDetails(newAllocated)
+                                          // Remove the booking detail
+                                          removeLinerBookingDetail(index)
+                                        }}
                                         className="bg-red-500 hover:bg-red-600 text-white px-3 py-1 rounded text-xs font-medium transition-all duration-200"
                                       >
                                         Remove
@@ -1477,7 +1523,14 @@ export function LinerBookingForm({
                                     </div>
                                   </div>
 
-                                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                                                                      {/* Hidden field to track if this booking detail is allocated */}
+                                    <input
+                                      type="hidden"
+                                      name={`liner_booking_details[${index}][allocated]`}
+                                      value={allocatedBookingDetails.has(index) ? "true" : "false"}
+                                    />
+
+                                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                                     {/* Equipment Selection - Only show if linked to shipment plan in edit mode */}
                                     {mode === "edit" &&
                                       linerBooking?.shipmentPlan &&
@@ -1945,18 +1998,7 @@ export function LinerBookingForm({
                   )}
                 </div>
 
-                {mode === "edit" && linerBooking?.shipmentPlan && requestedBookingDetails.length > 0 && (
-                  <div className="mt-4 flex justify-end">
-                    <button
-                      type="submit"
-                      name="_action"
-                      value="allocate_requested"
-                      className="px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2"
-                    >
-                      Allocate Requested Bookings
-                    </button>
-                  </div>
-                )}
+                {/* Individual allocation is now handled by the Allocate button on each form card */}
 
                 {/* Form Actions */}
                 <div className="px-6 py-4 bg-gray-50 border-t border-gray-200">
